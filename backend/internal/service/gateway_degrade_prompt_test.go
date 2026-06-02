@@ -10,20 +10,20 @@ import (
 func TestTruncateOversizedPrompt(t *testing.T) {
 	// 构造一个超过阈值的 body：很多条消息，每条约 8KB
 	var sb strings.Builder
-	sb.WriteString(`{"system":"sys","messages":[`)
+	_, _ = sb.WriteString(`{"system":"sys","messages":[`)
 	const n = 120
 	chunk := strings.Repeat("x", 8*1024)
 	for i := 0; i < n; i++ {
 		if i > 0 {
-			sb.WriteByte(',')
+			_ = sb.WriteByte(',')
 		}
 		role := "user"
 		if i%2 == 1 {
 			role = "assistant"
 		}
-		sb.WriteString(`{"role":"` + role + `","content":"` + chunk + `"}`)
+		_, _ = sb.WriteString(`{"role":"` + role + `","content":"` + chunk + `"}`)
 	}
-	sb.WriteString(`]}`)
+	_, _ = sb.WriteString(`]}`)
 	body := []byte(sb.String())
 
 	if len(body) <= maxPromptBodyBytes {

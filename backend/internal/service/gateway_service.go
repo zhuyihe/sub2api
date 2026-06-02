@@ -10067,19 +10067,20 @@ func (s *GatewayService) initDebugGatewayBodyFile(path string) {
 	}
 
 	// 如果 path 指向一个已存在的目录，自动追加默认文件名
-	if info, err := os.Stat(path); err == nil && info.IsDir() {
-		path = filepath.Join(path, debugGatewayBodyDefaultFilename)
+	// path 来自运维设置的环境变量 SUB2API_DEBUG_GATEWAY_BODY，是可信源；非外部用户输入。
+	if info, err := os.Stat(path); err == nil && info.IsDir() { //nolint:gosec // G304: trusted operator-provided debug path
+		path = filepath.Join(path, debugGatewayBodyDefaultFilename) //nolint:gosec // G304: same source
 	}
 
 	// 确保父目录存在
 	if dir := filepath.Dir(path); dir != "." {
-		if err := os.MkdirAll(dir, 0755); err != nil {
+		if err := os.MkdirAll(dir, 0755); err != nil { //nolint:gosec // G301: debug-only dir, intentional perms
 			slog.Error("failed to create gateway debug log directory", "dir", dir, "error", err)
 			return
 		}
 	}
 
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644) //nolint:gosec // G304/G302: same trusted operator-provided debug path
 	if err != nil {
 		slog.Error("failed to open gateway debug log file", "path", path, "error", err)
 		return
