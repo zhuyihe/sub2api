@@ -7,6 +7,29 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestNormalizeToolFunctionType(t *testing.T) {
+	// OpenAI 风格 tools[].type="function" 应被删除，name 保留
+	body := `{"tools":[{"type":"function","name":"x","input_schema":{"type":"object"}},{"type":"web_search_20260209","name":"y"}],"messages":[]}`
+	out, ok := normalizeToolFunctionType([]byte(body))
+	if !ok {
+		t.Fatal("expected change")
+	}
+	if gjson.GetBytes(out, "tools.0.type").Exists() {
+		t.Fatal("tools.0.type=function should be removed")
+	}
+	if gjson.GetBytes(out, "tools.0.name").String() != "x" {
+		t.Fatal("tools.0.name should be kept")
+	}
+	// 白名单 type 保留
+	if gjson.GetBytes(out, "tools.1.type").String() != "web_search_20260209" {
+		t.Fatal("tools.1.type=web_search should be kept")
+	}
+	// 无 function type 时不动
+	if _, ok := normalizeToolFunctionType([]byte(`{"tools":[{"name":"x"}],"messages":[]}`)); ok {
+		t.Fatal("no function type should not change")
+	}
+}
+
 func TestNormalizeToolChoice(t *testing.T) {
 	out, ok := normalizeToolChoice([]byte(`{"tool_choice":"auto","messages":[]}`))
 	if !ok {
