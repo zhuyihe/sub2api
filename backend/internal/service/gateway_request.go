@@ -1336,6 +1336,12 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 		degraded = append(degraded, "tool_choice:wrapped_object")
 	}
 
+	// 5a. tools[].type=="function"(OpenAI schema 误用) -> 删除 type 让默认为 custom
+	if next, ok := normalizeToolFunctionType(out); ok {
+		out = next
+		degraded = append(degraded, "tools_type_function:removed")
+	}
+
 	// 6. 图片 media_type 与真实格式不符 -> 修正
 	if next, ok := normalizeImageMediaType(out); ok {
 		out = next

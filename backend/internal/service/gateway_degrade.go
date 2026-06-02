@@ -17,6 +17,47 @@ import (
 	_ "golang.org/x/image/webp" // 注册 webp 解码器
 )
 
+// normalizeToolFunctionType 删除 tools[i].type == "function" 字段（OpenAI schema 误用）。
+// Anthropic 仅接受预定义工具 type 白名单(bash/code_execution/text_editor/web_fetch 等)
+// 或省略 type 让其默认为 custom。删除该字段即让客户端定义的工具按 custom 处理。
+func normalizeToolFunctionType(body []byte) ([]byte, bool) {
+	if !bytes.Contains(body, []byte(`"type":"function"`)) &&
+		!bytes.Contains(body, []byte(`"type": "function"`)) {
+		return body, false
+	}
+	toolsRes := gjson.GetBytes(body, "tools")
+	if !toolsRes.Exists() || !toolsRes.IsArray() {
+		return body, false
+	}
+	var tools []any
+	if err := json.Unmarshal(sliceRawFromBody(body, toolsRes), &tools); err != nil {
+		return body, false
+	}
+	changed := false
+	for _, t := range tools {
+		tm, ok := t.(map[string]any)
+		if !ok {
+			continue
+		}
+		if tm["type"] == "function" {
+			delete(tm, "type")
+			changed = true
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	tb, err := json.Marshal(tools)
+	if err != nil {
+		return body, false
+	}
+	out, err := sjson.SetRawBytes(body, "tools", tb)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
 // normalizeToolChoice 把字符串形式的 tool_choice 包装为对象 {"type": <value>}。
 // 上游要求 tool_choice 为对象，客户端误传字符串(如 "auto")会触发 400。
 func normalizeToolChoice(body []byte) ([]byte, bool) {
