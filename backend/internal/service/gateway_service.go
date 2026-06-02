@@ -723,10 +723,14 @@ func (s *GatewayService) GenerateSessionHash(parsed *ParsedRequest) string {
 			)
 			return uid.SessionID
 		}
-		slog.Info("sticky.hash_metadata_parse_failed",
-			"metadata_user_id", parsed.MetadataUserID,
+		// 解析失败时直接用原始 metadata.user_id 整串做粘性 key，
+		// 兼容下游传任意稳定 user_id/session_id(非标准格式)的情况，
+		// 避免回退到逐轮变化的消息内容摘要而导致账号乱跳。
+		slog.Info("sticky.hash_source",
+			"source", "metadata_user_id_raw",
 			"parsed_nil", uid == nil,
 		)
+		return s.hashContent(parsed.MetadataUserID)
 	}
 
 	// 2. 提取带 cache_control: {type: "ephemeral"} 的内容
@@ -4642,10 +4646,21 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		return nil, err
 	}
 
+	// 转发前对客户端不合规参数做语义无损降级，消除可预期的上游 400（默认开启，可配置关闭）。
+	if s.cfg == nil || s.cfg.Gateway.DegradeRequestParams {
+		if degraded, fields := DegradeAnthropicRequestParams(body, reqModel); len(fields) > 0 {
+			if err := replaceBody(degraded); err != nil {
+				return nil, err
+			}
+			logger.LegacyPrintf("service.gateway", "[degrade] request params degraded: %s (model=%s)", strings.Join(fields, "; "), reqModel)
+		}
+	}
+
 	// 重试循环
 	var resp *http.Response
 	lastWireBody := body
 	retryStart := time.Now()
+	var jsonNormalizeRetried bool
 	for attempt := 1; attempt <= maxRetryAttempts; attempt++ {
 		// 构建上游请求（每次重试需要重新构建，因为请求体需要重新读取）
 		upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, reqStream)
@@ -4690,6 +4705,23 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			respBody, readErr := s.readUpstreamErrorBody(resp)
 			if readErr == nil {
 				_ = resp.Body.Close()
+
+				// JSON 规范化事后重试：上游因非法转义/JSON 格式报 400 时，
+				// 用 Go 标准编码 re-marshal 后重试一次（仅一次，避免循环）。
+				// 守卫 attempt<max 确保 continue 后仍有下一轮，避免最后一轮 continue
+				// 导致循环退出后误用已关闭 body 的 resp。
+				if (s.cfg == nil || s.cfg.Gateway.DegradeRequestParams) && !jsonNormalizeRetried &&
+					attempt < maxRetryAttempts &&
+					looksLikeInvalidJSONError(respBody) && time.Since(retryStart) < maxRetryElapsed {
+					jsonNormalizeRetried = true
+					if normalized, normOK := renormalizeJSONBody(body); normOK {
+						logger.LegacyPrintf("service.gateway", "[degrade] Account %d: upstream invalid-JSON, retrying with re-marshaled body", account.ID)
+						if err := replaceBody(normalized); err != nil {
+							return nil, err
+						}
+						continue
+					}
+				}
 
 				if s.shouldRectifySignatureError(ctx, account, respBody) {
 					appendOpsUpstreamError(c, OpsUpstreamErrorEvent{
@@ -5164,6 +5196,13 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
 	}
 	// Pre-filter: strip empty text blocks (including nested in tool_result) to prevent upstream 400.
 	input.Body = StripEmptyTextBlocks(input.Body)
+	// 透传分支同样做语义无损降级，消除可预期的上游 400（默认开启，可配置关闭）。
+	if s.cfg == nil || s.cfg.Gateway.DegradeRequestParams {
+		if degraded, fields := DegradeAnthropicRequestParams(input.Body, input.RequestModel); len(fields) > 0 {
+			input.Body = degraded
+			logger.LegacyPrintf("service.gateway", "[degrade] request params degraded: %s (model=%s)", strings.Join(fields, "; "), input.RequestModel)
+		}
+	}
 	if input.Parsed != nil {
 		// 透传分支也会改写实际 wire body，成功 usage hash 依赖这里同步当前 body。
 		if err := input.Parsed.ReplaceBody(input.Body); err != nil {

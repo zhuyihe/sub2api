@@ -1252,3 +1252,228 @@ func RectifyThinkingBudget(body []byte) ([]byte, bool) {
 
 	return modified, changed
 }
+
+// anthropic4xModelRe 匹配 claude-opus-4-* / claude-sonnet-4-* 系列模型。
+var anthropic4xModelRe = regexp.MustCompile(`claude-(?:opus|sonnet)-4-`)
+
+// reasoningEffortPaths 是 effort 透传字段可能出现的 JSON 路径。
+// 网关本身不解析 effort（仅 model-pricing 用 reasoning_effort 命名），故覆盖常见路径。
+var reasoningEffortPaths = []string{"reasoning_effort", "thinking.effort", "reasoning.effort"}
+
+// DegradeAnthropicRequestParams 在转发前对客户端不合规参数做"语义无损"降级，
+// 以消除可预期的上游 400。仅处理能安全改写的项；每发生一次降级返回的 changed=true，
+// 由调用方记录日志（显式、非静默）。任何步骤失败均 fail-safe 返回当前 body，不破坏请求。
+//
+// 处理项：
+//  1. effort=="xhigh" -> "max"（部分模型仅支持 low/medium/high/max）
+//  2. temperature 与 top_p 同时存在 -> 删除 temperature（保留 top_p）
+//  3. claude-*-4.x 模型上的 temperature（已弃用）-> 删除
+//  4. role=="system" 的 message -> 合并进顶层 system 字段并从 messages 移除
+//
+// 不处理（需客户端修，避免破坏语义）：prompt 过长、图片、未声明工具、
+// 非法 JSON、cache_control 顺序/数量、assistant 结尾 prefill。
+func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string) {
+	out := body
+	var degraded []string
+
+	// 1. effort xhigh -> max
+	for _, p := range reasoningEffortPaths {
+		if gjson.GetBytes(out, p).String() != "xhigh" {
+			continue
+		}
+		if next, err := sjson.SetBytes(out, p, "max"); err == nil {
+			out = next
+			degraded = append(degraded, p+":xhigh->max")
+		}
+	}
+
+	// 1b. claude-*-4.x 已弃用 top_k -> 删除（老模型保留）
+	if anthropic4xModelRe.MatchString(model) && gjson.GetBytes(out, "top_k").Exists() {
+		if next, ok := deleteJSONPathBytes(out, "top_k"); ok {
+			out = next
+			degraded = append(degraded, "top_k:4x_removed")
+		}
+	}
+
+	// 2. temperature + top_p 冲突 -> 删 temperature
+	if gjson.GetBytes(out, "temperature").Exists() && gjson.GetBytes(out, "top_p").Exists() {
+		if next, ok := deleteJSONPathBytes(out, "temperature"); ok {
+			out = next
+			degraded = append(degraded, "temperature:conflict_top_p_removed")
+		}
+	}
+
+	// 3. 4.x 模型删 deprecated temperature
+	if anthropic4xModelRe.MatchString(model) && gjson.GetBytes(out, "temperature").Exists() {
+		if next, ok := deleteJSONPathBytes(out, "temperature"); ok {
+			out = next
+			degraded = append(degraded, "temperature:4x_deprecated_removed")
+		}
+	}
+
+	// 4. role==system 消息合并进顶层 system
+	if next, ok := mergeSystemRoleMessages(out); ok {
+		out = next
+		degraded = append(degraded, "role_system:merged_to_top_level")
+	}
+
+	// 5. tool_choice 字符串 -> 对象
+	if next, ok := normalizeToolChoice(out); ok {
+		out = next
+		degraded = append(degraded, "tool_choice:wrapped_object")
+	}
+
+	// 6. 图片 media_type 与真实格式不符 -> 修正
+	if next, ok := normalizeImageMediaType(out); ok {
+		out = next
+		degraded = append(degraded, "image_media_type:corrected")
+	}
+
+	// 7. tool_use.id / tool_result.tool_use_id 非法字符 -> 清洗
+	if next, ok := sanitizeToolUseIDs(out); ok {
+		out = next
+		degraded = append(degraded, "tool_use_id:sanitized")
+	}
+
+	// 8. cache_control 断点超量 -> 删除多余
+	if next, ok := limitCacheControlBlocks(out, maxCacheControlBlocks); ok {
+		out = next
+		degraded = append(degraded, "cache_control:trimmed")
+	}
+
+	// 9. 被引用但未声明的工具 -> 补占位 schema（有损）
+	if next, ok := backfillMissingTools(out); ok {
+		out = next
+		degraded = append(degraded, "missing_tools:backfilled")
+	}
+
+	// 10. assistant 结尾的 prefill -> 追加 user 消息（有损）
+	if next, ok := appendUserForAssistantPrefill(out); ok {
+		out = next
+		degraded = append(degraded, "assistant_prefill:user_appended")
+	}
+
+	// 11. cache_control ttl 顺序冲突 -> 删 ttl 归一化（有损）
+	if next, ok := normalizeCacheControlTTL(out); ok {
+		out = next
+		degraded = append(degraded, "cache_control_ttl:normalized")
+	}
+
+	// 12. 超限图片 -> 删除超限图片块（有损）
+	if next, ok := removeOversizedImages(out); ok {
+		out = next
+		degraded = append(degraded, "oversized_image:removed")
+	}
+
+	// 13. body 过大 -> 截断最旧历史（有损，best-effort，可能误伤正常长对话）
+	if next, ok := truncateOversizedPrompt(out); ok {
+		out = next
+		degraded = append(degraded, "oversized_prompt:truncated")
+	}
+
+	return out, degraded
+}
+
+// mergeSystemRoleMessages 把 messages 中 role=="system" 的项文本前置合并进顶层
+// system 字段，并从 messages 移除这些项。顶层 system 既可为 string 也可为内容块数组。
+func mergeSystemRoleMessages(body []byte) ([]byte, bool) {
+	// Fast-path: 无 role=system 时直接返回，避免对每个请求全量 unmarshal messages。
+	if !bytes.Contains(body, []byte(`"role":"system"`)) &&
+		!bytes.Contains(body, []byte(`"role": "system"`)) {
+		return body, false
+	}
+
+	msgsRes := gjson.GetBytes(body, "messages")
+	if !msgsRes.Exists() || !msgsRes.IsArray() {
+		return body, false
+	}
+
+	var messages []any
+	if err := json.Unmarshal(sliceRawFromBody(body, msgsRes), &messages); err != nil {
+		return body, false
+	}
+
+	var sysTexts []string
+	kept := make([]any, 0, len(messages))
+	for _, m := range messages {
+		mm, ok := m.(map[string]any)
+		if ok && mm["role"] == "system" {
+			// 仅当能提取到纯文本时才合并并移除该消息；含非文本内容(如图片块)的
+			// system 消息保持不动，避免丢失数据。注：system 通常位于首位，
+			// 移除后不破坏 user/assistant 交替；中间位置极罕见，不额外处理。
+			if t := extractMessageContentText(mm["content"]); t != "" {
+				sysTexts = append(sysTexts, t)
+				continue
+			}
+		}
+		kept = append(kept, m)
+	}
+	if len(sysTexts) == 0 {
+		return body, false
+	}
+
+	out, err := prependTopLevelSystem(body, strings.Join(sysTexts, "\n\n"))
+	if err != nil {
+		return body, false
+	}
+	keptBytes, err := json.Marshal(kept)
+	if err != nil {
+		return body, false
+	}
+	out, err = sjson.SetRawBytes(out, "messages", keptBytes)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+// prependTopLevelSystem 把 text 前置到顶层 system：不存在则直接置为字符串；
+// 已是字符串则拼接；已是数组则在数组头部插入一个 text 块。
+func prependTopLevelSystem(body []byte, text string) ([]byte, error) {
+	sys := gjson.GetBytes(body, "system")
+	if !sys.Exists() {
+		return sjson.SetBytes(body, "system", text)
+	}
+	if sys.Type == gjson.String {
+		return sjson.SetBytes(body, "system", text+"\n\n"+sys.String())
+	}
+	if sys.IsArray() {
+		var blocks []any
+		if err := json.Unmarshal(sliceRawFromBody(body, sys), &blocks); err != nil {
+			return body, err
+		}
+		head := map[string]any{"type": "text", "text": text}
+		blocks = append([]any{head}, blocks...)
+		bb, err := json.Marshal(blocks)
+		if err != nil {
+			return body, err
+		}
+		return sjson.SetRawBytes(body, "system", bb)
+	}
+	return body, fmt.Errorf("unsupported system field type")
+}
+
+// extractMessageContentText 提取一条消息 content 的纯文本：content 可为字符串，
+// 或内容块数组（取其中 type=="text" 的 text 拼接）。
+func extractMessageContentText(content any) string {
+	switch v := content.(type) {
+	case string:
+		return v
+	case []any:
+		var parts []string
+		for _, blk := range v {
+			bm, ok := blk.(map[string]any)
+			if !ok {
+				continue
+			}
+			if bm["type"] == "text" {
+				if t, ok := bm["text"].(string); ok && t != "" {
+					parts = append(parts, t)
+				}
+			}
+		}
+		return strings.Join(parts, "\n")
+	default:
+		return ""
+	}
+}

@@ -1,0 +1,102 @@
+package service
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/tidwall/gjson"
+)
+
+func TestNormalizeToolChoice(t *testing.T) {
+	out, ok := normalizeToolChoice([]byte(`{"tool_choice":"auto","messages":[]}`))
+	if !ok {
+		t.Fatal("expected change")
+	}
+	if gjson.GetBytes(out, "tool_choice.type").String() != "auto" {
+		t.Fatalf("tool_choice.type=%s, want auto", gjson.GetBytes(out, "tool_choice.type").String())
+	}
+	// 已是对象时不动
+	if _, ok := normalizeToolChoice([]byte(`{"tool_choice":{"type":"auto"}}`)); ok {
+		t.Fatal("object tool_choice should not change")
+	}
+}
+
+func TestNormalizeImageMediaType(t *testing.T) {
+	// 声明 jpeg 实为 png(iVBORw0KGgo 前缀)
+	body := `{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"iVBORw0KGgoAAAA"}}]}]}`
+	out, ok := normalizeImageMediaType([]byte(body))
+	if !ok {
+		t.Fatal("expected media_type corrected")
+	}
+	got := gjson.GetBytes(out, "messages.0.content.0.source.media_type").String()
+	if got != "image/png" {
+		t.Fatalf("media_type=%s, want image/png", got)
+	}
+	// 一致时不动
+	ok2body := `{"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgo"}}]}]}`
+	if _, ok := normalizeImageMediaType([]byte(ok2body)); ok {
+		t.Fatal("matching media_type should not change")
+	}
+}
+
+func TestSanitizeToolUseIDs(t *testing.T) {
+	// tool_use.id 与 tool_result.tool_use_id 含非法字符，应被一致清洗
+	body := `{"messages":[
+		{"role":"assistant","content":[{"type":"tool_use","id":"call:abc#1","name":"x","input":{}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"call:abc#1","content":"ok"}]}
+	]}`
+	out, ok := sanitizeToolUseIDs([]byte(body))
+	if !ok {
+		t.Fatal("expected sanitize")
+	}
+	id := gjson.GetBytes(out, "messages.0.content.0.id").String()
+	ref := gjson.GetBytes(out, "messages.1.content.0.tool_use_id").String()
+	if id != "call_abc_1" {
+		t.Fatalf("id=%s, want call_abc_1", id)
+	}
+	if id != ref {
+		t.Fatalf("id(%s) != tool_use_id(%s), 引用不一致", id, ref)
+	}
+	// 合法 id 不动
+	if _, ok := sanitizeToolUseIDs([]byte(`{"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01ABC","name":"x","input":{}}]}]}`)); ok {
+		t.Fatal("valid id should not change")
+	}
+}
+
+func TestLimitCacheControlBlocks(t *testing.T) {
+	// 5 个 cache_control，上限 4，应删 1
+	body := `{"system":[
+		{"type":"text","text":"a","cache_control":{"type":"ephemeral"}},
+		{"type":"text","text":"b","cache_control":{"type":"ephemeral"}}
+	],"messages":[
+		{"role":"user","content":[
+			{"type":"text","text":"c","cache_control":{"type":"ephemeral"}},
+			{"type":"text","text":"d","cache_control":{"type":"ephemeral"}},
+			{"type":"text","text":"e","cache_control":{"type":"ephemeral"}}
+		]}
+	]}`
+	out, ok := limitCacheControlBlocks([]byte(body), 4)
+	if !ok {
+		t.Fatal("expected trim")
+	}
+	if !gjson.ValidBytes(out) {
+		t.Fatalf("invalid json: %s", out)
+	}
+	if n := countCacheControl(out); n != 4 {
+		t.Fatalf("remaining cache_control=%d, want 4", n)
+	}
+	// 恰好 4 个不动
+	body4 := `{"messages":[{"role":"user","content":[
+		{"type":"text","text":"a","cache_control":{"type":"ephemeral"}},
+		{"type":"text","text":"b","cache_control":{"type":"ephemeral"}},
+		{"type":"text","text":"c","cache_control":{"type":"ephemeral"}},
+		{"type":"text","text":"d","cache_control":{"type":"ephemeral"}}
+	]}]}`
+	if _, ok := limitCacheControlBlocks([]byte(body4), 4); ok {
+		t.Fatal("exactly-max should not change")
+	}
+}
+
+func countCacheControl(body []byte) int {
+	return strings.Count(string(body), `"cache_control"`)
+}

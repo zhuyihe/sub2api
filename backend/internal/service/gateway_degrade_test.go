@@ -1,0 +1,178 @@
+package service
+
+import (
+	"testing"
+
+	"github.com/tidwall/gjson"
+)
+
+func TestDegradeAnthropicRequestParams(t *testing.T) {
+	tests := []struct {
+		name      string
+		body      string
+		model     string
+		wantNum   int // 期望发生的降级项数量
+		assertion func(t *testing.T, out []byte)
+	}{
+		{
+			name:    "effort xhigh 顶层 reasoning_effort 改 max",
+			body:    `{"model":"claude-opus-4-8","reasoning_effort":"xhigh","messages":[{"role":"user","content":"hi"}]}`,
+			model:   "claude-opus-4-8",
+			wantNum: 1,
+			assertion: func(t *testing.T, out []byte) {
+				if got := gjson.GetBytes(out, "reasoning_effort").String(); got != "max" {
+					t.Fatalf("reasoning_effort=%q, want max", got)
+				}
+			},
+		},
+		{
+			name:    "temperature 与 top_p 冲突删 temperature 保 top_p",
+			body:    `{"model":"claude-sonnet-4-6","temperature":0.7,"top_p":0.9,"messages":[{"role":"user","content":"hi"}]}`,
+			model:   "claude-sonnet-4-6",
+			wantNum: 1, // 冲突删除后 temperature 已不存在，不再触发 4.x 删除
+			assertion: func(t *testing.T, out []byte) {
+				if gjson.GetBytes(out, "temperature").Exists() {
+					t.Fatal("temperature should be removed")
+				}
+				if !gjson.GetBytes(out, "top_p").Exists() {
+					t.Fatal("top_p should be kept")
+				}
+			},
+		},
+		{
+			name:    "4.x 模型删 deprecated temperature(无 top_p)",
+			body:    `{"model":"claude-opus-4-7","temperature":0.5,"messages":[{"role":"user","content":"hi"}]}`,
+			model:   "claude-opus-4-7",
+			wantNum: 1,
+			assertion: func(t *testing.T, out []byte) {
+				if gjson.GetBytes(out, "temperature").Exists() {
+					t.Fatal("temperature should be removed for 4.x")
+				}
+			},
+		},
+		{
+			name:    "4.x 模型删 top_k",
+			body:    `{"model":"claude-opus-4-7","top_k":40,"messages":[{"role":"user","content":"hi"}]}`,
+			model:   "claude-opus-4-7",
+			wantNum: 1,
+			assertion: func(t *testing.T, out []byte) {
+				if gjson.GetBytes(out, "top_k").Exists() {
+					t.Fatal("top_k should be removed for 4.x")
+				}
+			},
+		},
+		{
+			name:    "老模型保留 top_k",
+			body:    `{"model":"claude-3-5-sonnet","top_k":40,"messages":[{"role":"user","content":"hi"}]}`,
+			model:   "claude-3-5-sonnet",
+			wantNum: 0,
+			assertion: func(t *testing.T, out []byte) {
+				if !gjson.GetBytes(out, "top_k").Exists() {
+					t.Fatal("top_k should be kept for legacy model")
+				}
+			},
+		},
+		{
+			name:    "老模型保留 temperature",
+			body:    `{"model":"claude-3-5-sonnet","temperature":0.5,"messages":[{"role":"user","content":"hi"}]}`,
+			model:   "claude-3-5-sonnet",
+			wantNum: 0,
+			assertion: func(t *testing.T, out []byte) {
+				if !gjson.GetBytes(out, "temperature").Exists() {
+					t.Fatal("temperature should be kept for legacy model")
+				}
+			},
+		},
+		{
+			name:    "role system 合并进顶层 system(原无 system)",
+			body:    `{"model":"claude-sonnet-4-6","messages":[{"role":"system","content":"你是助手"},{"role":"user","content":"hi"}]}`,
+			model:   "claude-sonnet-4-6",
+			wantNum: 1,
+			assertion: func(t *testing.T, out []byte) {
+				if got := gjson.GetBytes(out, "system").String(); got != "你是助手" {
+					t.Fatalf("system=%q, want 你是助手", got)
+				}
+				if n := len(gjson.GetBytes(out, "messages").Array()); n != 1 {
+					t.Fatalf("messages len=%d, want 1", n)
+				}
+				if role := gjson.GetBytes(out, "messages.0.role").String(); role != "user" {
+					t.Fatalf("first message role=%q, want user", role)
+				}
+			},
+		},
+		{
+			name:    "role system 前置合并进已有字符串 system",
+			body:    `{"model":"claude-sonnet-4-6","system":"原始","messages":[{"role":"system","content":"附加"},{"role":"user","content":"hi"}]}`,
+			model:   "claude-sonnet-4-6",
+			wantNum: 1,
+			assertion: func(t *testing.T, out []byte) {
+				if got := gjson.GetBytes(out, "system").String(); got != "附加\n\n原始" {
+					t.Fatalf("system=%q, want 附加\\n\\n原始", got)
+				}
+			},
+		},
+		{
+			name:    "role system content 为内容块数组",
+			body:    `{"model":"claude-sonnet-4-6","messages":[{"role":"system","content":[{"type":"text","text":"块文本"}]},{"role":"user","content":"hi"}]}`,
+			model:   "claude-sonnet-4-6",
+			wantNum: 1,
+			assertion: func(t *testing.T, out []byte) {
+				if got := gjson.GetBytes(out, "system").String(); got != "块文本" {
+					t.Fatalf("system=%q, want 块文本", got)
+				}
+			},
+		},
+		{
+			name:    "顶层 system 为数组时前置 text 块",
+			body:    `{"model":"claude-sonnet-4-6","system":[{"type":"text","text":"原块"}],"messages":[{"role":"system","content":"新"},{"role":"user","content":"hi"}]}`,
+			model:   "claude-sonnet-4-6",
+			wantNum: 1,
+			assertion: func(t *testing.T, out []byte) {
+				arr := gjson.GetBytes(out, "system").Array()
+				if len(arr) != 2 {
+					t.Fatalf("system array len=%d, want 2", len(arr))
+				}
+				if got := gjson.GetBytes(out, "system.0.text").String(); got != "新" {
+					t.Fatalf("system[0].text=%q, want 新", got)
+				}
+			},
+		},
+		{
+			name:    "role system 含非文本内容时保持不动(不丢数据)",
+			body:    `{"model":"claude-sonnet-4-6","messages":[{"role":"system","content":[{"type":"image","source":{"type":"base64","data":"x"}}]},{"role":"user","content":"hi"}]}`,
+			model:   "claude-sonnet-4-6",
+			wantNum: 0,
+			assertion: func(t *testing.T, out []byte) {
+				if n := len(gjson.GetBytes(out, "messages").Array()); n != 2 {
+					t.Fatalf("messages len=%d, want 2 (system 消息应保留)", n)
+				}
+			},
+		},
+		{
+			name:    "无需降级时 body 不变",
+			body:    `{"model":"claude-sonnet-4-6","top_p":0.9,"system":"x","messages":[{"role":"user","content":"hi"}]}`,
+			model:   "claude-sonnet-4-6",
+			wantNum: 0,
+			assertion: func(t *testing.T, out []byte) {
+				if !gjson.GetBytes(out, "top_p").Exists() {
+					t.Fatal("top_p should remain")
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, fields := DegradeAnthropicRequestParams([]byte(tt.body), tt.model)
+			if len(fields) != tt.wantNum {
+				t.Fatalf("degraded fields=%d %v, want %d", len(fields), fields, tt.wantNum)
+			}
+			if !gjson.ValidBytes(out) {
+				t.Fatalf("output is not valid JSON: %s", out)
+			}
+			if tt.assertion != nil {
+				tt.assertion(t, out)
+			}
+		})
+	}
+}
