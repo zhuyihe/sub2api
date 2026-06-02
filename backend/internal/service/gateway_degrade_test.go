@@ -26,16 +26,16 @@ func TestDegradeAnthropicRequestParams(t *testing.T) {
 			},
 		},
 		{
-			name:    "temperature 与 top_p 冲突删 temperature 保 top_p",
+			name:    "4.x 模型 temperature 与 top_p 均弃用,全部删除",
 			body:    `{"model":"claude-sonnet-4-6","temperature":0.7,"top_p":0.9,"messages":[{"role":"user","content":"hi"}]}`,
 			model:   "claude-sonnet-4-6",
-			wantNum: 1, // 冲突删除后 temperature 已不存在，不再触发 4.x 删除
+			wantNum: 2, // 4.x: top_p 删除 + temperature 删除
 			assertion: func(t *testing.T, out []byte) {
 				if gjson.GetBytes(out, "temperature").Exists() {
 					t.Fatal("temperature should be removed")
 				}
-				if !gjson.GetBytes(out, "top_p").Exists() {
-					t.Fatal("top_p should be kept")
+				if gjson.GetBytes(out, "top_p").Exists() {
+					t.Fatal("top_p should be removed")
 				}
 			},
 		},
@@ -58,6 +58,32 @@ func TestDegradeAnthropicRequestParams(t *testing.T) {
 			assertion: func(t *testing.T, out []byte) {
 				if gjson.GetBytes(out, "top_k").Exists() {
 					t.Fatal("top_k should be removed for 4.x")
+				}
+			},
+		},
+		{
+			name:    "4.x 模型同时删 top_k 和 top_p",
+			body:    `{"model":"claude-opus-4-7","top_k":40,"top_p":0.9,"messages":[{"role":"user","content":"hi"}]}`,
+			model:   "claude-opus-4-7",
+			wantNum: 2,
+			assertion: func(t *testing.T, out []byte) {
+				if gjson.GetBytes(out, "top_k").Exists() || gjson.GetBytes(out, "top_p").Exists() {
+					t.Fatal("top_k and top_p should both be removed for 4.x")
+				}
+			},
+		},
+		{
+			name:    "thinking.adaptive.effort 完全删除(Extra inputs not permitted)",
+			body:    `{"model":"claude-opus-4-7","thinking":{"type":"enabled","adaptive":{"effort":"xhigh"}},"messages":[{"role":"user","content":"hi"}]}`,
+			model:   "claude-opus-4-7",
+			wantNum: 1,
+			assertion: func(t *testing.T, out []byte) {
+				if gjson.GetBytes(out, "thinking.adaptive.effort").Exists() {
+					t.Fatal("thinking.adaptive.effort should be removed")
+				}
+				// thinking 本身保留
+				if !gjson.GetBytes(out, "thinking.type").Exists() {
+					t.Fatal("thinking.type should be kept")
 				}
 			},
 		},
@@ -149,13 +175,13 @@ func TestDegradeAnthropicRequestParams(t *testing.T) {
 			},
 		},
 		{
-			name:    "无需降级时 body 不变",
-			body:    `{"model":"claude-sonnet-4-6","top_p":0.9,"system":"x","messages":[{"role":"user","content":"hi"}]}`,
-			model:   "claude-sonnet-4-6",
+			name:    "无需降级时 body 不变(老模型保留 top_p)",
+			body:    `{"model":"claude-3-5-sonnet-20241022","top_p":0.9,"system":"x","messages":[{"role":"user","content":"hi"}]}`,
+			model:   "claude-3-5-sonnet-20241022",
 			wantNum: 0,
 			assertion: func(t *testing.T, out []byte) {
 				if !gjson.GetBytes(out, "top_p").Exists() {
-					t.Fatal("top_p should remain")
+					t.Fatal("top_p should remain for legacy model")
 				}
 			},
 		},

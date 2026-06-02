@@ -1276,7 +1276,7 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 	out := body
 	var degraded []string
 
-	// 1. effort xhigh -> max
+	// 1. effort xhigh -> max（仅当字段值合法但需 normalize）
 	for _, p := range reasoningEffortPaths {
 		if gjson.GetBytes(out, p).String() != "xhigh" {
 			continue
@@ -1287,11 +1287,24 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 		}
 	}
 
-	// 1b. claude-*-4.x 已弃用 top_k -> 删除（老模型保留）
-	if anthropic4xModelRe.MatchString(model) && gjson.GetBytes(out, "top_k").Exists() {
-		if next, ok := deleteJSONPathBytes(out, "top_k"); ok {
+	// 1a. thinking.adaptive.effort 字段完全不被上游接受（Extra inputs are not permitted）-> 删除
+	if gjson.GetBytes(out, "thinking.adaptive.effort").Exists() {
+		if next, ok := deleteJSONPathBytes(out, "thinking.adaptive.effort"); ok {
 			out = next
-			degraded = append(degraded, "top_k:4x_removed")
+			degraded = append(degraded, "thinking.adaptive.effort:removed")
+		}
+	}
+
+	// 1b. claude-*-4.x 已弃用 top_k 与 top_p -> 删除（老模型保留）
+	if anthropic4xModelRe.MatchString(model) {
+		for _, p := range []string{"top_k", "top_p"} {
+			if !gjson.GetBytes(out, p).Exists() {
+				continue
+			}
+			if next, ok := deleteJSONPathBytes(out, p); ok {
+				out = next
+				degraded = append(degraded, p+":4x_removed")
+			}
 		}
 	}
 
