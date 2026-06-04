@@ -1360,6 +1360,12 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 		degraded = append(degraded, "cache_control:trimmed")
 	}
 
+	// 8a. 孤儿 tool_result(对话完整性): 在前置 assistant 追加占位 tool_use 配对(有损)
+	if next, ok := pairOrphanToolResults(out); ok {
+		out = next
+		degraded = append(degraded, "orphan_tool_result:paired")
+	}
+
 	// 9. 被引用但未声明的工具 -> 补占位 schema（有损）
 	if next, ok := backfillMissingTools(out); ok {
 		out = next
