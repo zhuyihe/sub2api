@@ -1177,7 +1177,44 @@ const (
 	BudgetRectifyMaxTokens = 64000
 	// BudgetRectifyMinMaxTokens is the minimum max_tokens that must exceed budget_tokens.
 	BudgetRectifyMinMaxTokens = 32001
+	// minThinkingBudgetTokens 是 Anthropic 要求的 thinking.budget_tokens 下限。
+	minThinkingBudgetTokens = 1024
 )
+
+// rectifyThinkingBudgetVsMaxTokens 预防性修正 thinking.budget_tokens >= max_tokens 的请求，
+// 避免上游 "max_tokens must be greater than thinking.budget_tokens" 的 400。
+//
+// 与 RectifyThinkingBudget(POST-400 retry 用，激进固定 32000/64000)不同，此函数面向
+// 「发往上游前」的预防性降级（Passthrough 路径无 retry，必须靠它兜底）：仅在约束被实际
+// 违反时改写，且追求最小改动、保留客户端意图：
+//   - max_tokens 充裕(> 下限)时，下调 budget_tokens = max_tokens-1，保留客户端 max_tokens 输出预算；
+//   - max_tokens 过小(<= 下限)时，下调会跌破 1024 下限，改为上调 max_tokens = budget_tokens+1。
+//
+// thinking.type == "adaptive" 时跳过（预算由上游自管）。无 thinking 字段或字段缺省时跳过。
+func rectifyThinkingBudgetVsMaxTokens(body []byte) ([]byte, bool) {
+	thinking := gjson.GetBytes(body, "thinking")
+	if !thinking.Exists() || thinking.Get("type").String() == "adaptive" {
+		return body, false
+	}
+	budget := gjson.GetBytes(body, "thinking.budget_tokens").Int()
+	maxTokens := gjson.GetBytes(body, "max_tokens").Int()
+	if budget <= 0 || maxTokens <= 0 || maxTokens > budget {
+		return body, false // 缺字段无法判断，或已合规(max>budget)
+	}
+	// 违反约束：max_tokens <= budget
+	if maxTokens > minThinkingBudgetTokens {
+		// max-1 >= 1024，下调 budget 即可且不跌破下限，保留客户端 max_tokens
+		if next, err := sjson.SetBytes(body, "thinking.budget_tokens", maxTokens-1); err == nil {
+			return next, true
+		}
+		return body, false
+	}
+	// max_tokens 过小，其下无法容纳 >=1024 的 budget，改为上调 max_tokens
+	if next, err := sjson.SetBytes(body, "max_tokens", budget+1); err == nil {
+		return next, true
+	}
+	return body, false
+}
 
 // isThinkingBudgetConstraintError detects whether an upstream error message indicates
 // a budget_tokens constraint violation. Two flavours are covered:
@@ -1317,6 +1354,15 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 		}
 	}
 
+	// 1c. 顶层 speed 字段不被 Anthropic 接受（"speed: Extra inputs are not permitted"）-> 删除。
+	// 实测 user 104 客户端持续发送此字段触发 400（Passthrough 路径无 retry，必须预防性删除）。
+	if gjson.GetBytes(out, "speed").Exists() {
+		if next, ok := deleteJSONPathBytes(out, "speed"); ok {
+			out = next
+			degraded = append(degraded, "speed:removed")
+		}
+	}
+
 	// 2. temperature + top_p 冲突 -> 删 temperature
 	if gjson.GetBytes(out, "temperature").Exists() && gjson.GetBytes(out, "top_p").Exists() {
 		if next, ok := deleteJSONPathBytes(out, "temperature"); ok {
@@ -1331,6 +1377,14 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 			out = next
 			degraded = append(degraded, "temperature:4x_deprecated_removed")
 		}
+	}
+
+	// 3b. thinking.budget_tokens >= max_tokens -> 预防性整流（Passthrough 路径无 POST-400
+	// retry，必须在发往上游前修正，否则上游直接 400 "max_tokens must be greater than
+	// thinking.budget_tokens" 回传客户端，实测 user 104 即此路径）。
+	if next, ok := rectifyThinkingBudgetVsMaxTokens(out); ok {
+		out = next
+		degraded = append(degraded, "thinking_budget:rectified_vs_max_tokens")
 	}
 
 	// 4. role==system 消息合并进顶层 system

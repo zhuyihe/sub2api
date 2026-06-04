@@ -88,6 +88,17 @@ func TestDegradeAnthropicRequestParams(t *testing.T) {
 			},
 		},
 		{
+			name:    "顶层 speed 字段删除(Extra inputs not permitted, user 104 实际遇到)",
+			body:    `{"model":"claude-opus-4-7","speed":"fast","messages":[{"role":"user","content":"hi"}]}`,
+			model:   "claude-opus-4-7",
+			wantNum: 1,
+			assertion: func(t *testing.T, out []byte) {
+				if gjson.GetBytes(out, "speed").Exists() {
+					t.Fatal("top-level speed should be removed")
+				}
+			},
+		},
+		{
 			name:    "老模型保留 top_k",
 			body:    `{"model":"claude-3-5-sonnet","top_k":40,"messages":[{"role":"user","content":"hi"}]}`,
 			model:   "claude-3-5-sonnet",

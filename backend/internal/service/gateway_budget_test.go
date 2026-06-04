@@ -114,3 +114,117 @@ func TestRectifyThinkingBudget_AdaptiveSkipped(t *testing.T) {
 		t.Fatalf("max_tokens=%d, want 100", got)
 	}
 }
+
+// TestRectifyThinkingBudgetVsMaxTokens 验证「预防性」budget 整流（用于 Passthrough 路径，
+// 该路径无 POST-400 retry，必须在发往上游前就修正 max_tokens <= budget_tokens 的违规）。
+// 与 RectifyThinkingBudget(激进，固定 32000/64000)不同，这里追求最小改动、保留客户端意图。
+func TestRectifyThinkingBudgetVsMaxTokens(t *testing.T) {
+	tests := []struct {
+		name       string
+		body       string
+		wantChange bool
+		wantBudget int64 // -1 表示不校验
+		wantMax    int64 // -1 表示不校验
+	}{
+		{
+			name:       "合规请求(max>budget)零改动",
+			body:       `{"thinking":{"type":"enabled","budget_tokens":10000},"max_tokens":20000}`,
+			wantChange: false,
+			wantBudget: 10000,
+			wantMax:    20000,
+		},
+		{
+			name:       "budget==max(本次 user 104 形态): 下调 budget",
+			body:       `{"thinking":{"type":"enabled","budget_tokens":32000},"max_tokens":32000}`,
+			wantChange: true,
+			wantBudget: 31999,
+			wantMax:    32000,
+		},
+		{
+			name:       "budget>max 且 max 充裕: 下调 budget 至 max-1",
+			body:       `{"thinking":{"type":"enabled","budget_tokens":50000},"max_tokens":8192}`,
+			wantChange: true,
+			wantBudget: 8191,
+			wantMax:    8192,
+		},
+		{
+			name:       "max 过小(<=1024 下限)无法下调 budget: 上调 max",
+			body:       `{"thinking":{"type":"enabled","budget_tokens":32000},"max_tokens":512}`,
+			wantChange: true,
+			wantBudget: 32000,
+			wantMax:    32001,
+		},
+		{
+			name:       "max 恰为 1024 下限: 上调 max(不可下调 budget 至 1023)",
+			body:       `{"thinking":{"type":"enabled","budget_tokens":2000},"max_tokens":1024}`,
+			wantChange: true,
+			wantBudget: 2000,
+			wantMax:    2001,
+		},
+		{
+			name:       "adaptive 跳过",
+			body:       `{"thinking":{"type":"adaptive","budget_tokens":50000},"max_tokens":100}`,
+			wantChange: false,
+			wantBudget: 50000,
+			wantMax:    100,
+		},
+		{
+			name:       "无 thinking 字段跳过",
+			body:       `{"max_tokens":100}`,
+			wantChange: false,
+			wantBudget: -1,
+			wantMax:    100,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, changed := rectifyThinkingBudgetVsMaxTokens([]byte(tt.body))
+			if changed != tt.wantChange {
+				t.Fatalf("changed=%v, want %v (body=%s)", changed, tt.wantChange, tt.body)
+			}
+			if tt.wantBudget >= 0 {
+				if got := gjson.GetBytes(out, "thinking.budget_tokens").Int(); got != tt.wantBudget {
+					t.Fatalf("budget_tokens=%d, want %d", got, tt.wantBudget)
+				}
+			}
+			if tt.wantMax >= 0 {
+				if got := gjson.GetBytes(out, "max_tokens").Int(); got != tt.wantMax {
+					t.Fatalf("max_tokens=%d, want %d", got, tt.wantMax)
+				}
+			}
+			// 改动后必须满足上游约束: max_tokens 严格大于 budget_tokens
+			if changed {
+				b := gjson.GetBytes(out, "thinking.budget_tokens").Int()
+				m := gjson.GetBytes(out, "max_tokens").Int()
+				if m <= b {
+					t.Fatalf("整流后仍违规: max_tokens=%d <= budget_tokens=%d", m, b)
+				}
+				if b < minThinkingBudgetTokens {
+					t.Fatalf("整流后 budget_tokens=%d 跌破下限 %d", b, minThinkingBudgetTokens)
+				}
+			}
+		})
+	}
+}
+
+// TestDegradeAnthropicRequestParams_BudgetPreemptive 验证预防性 budget 整流已接入
+// DegradeAnthropicRequestParams pipeline，并产生 degrade 字段标记（Passthrough 路径依赖此步）。
+func TestDegradeAnthropicRequestParams_BudgetPreemptive(t *testing.T) {
+	body := []byte(`{"model":"claude-opus-4-7","thinking":{"type":"enabled","budget_tokens":32000},"max_tokens":32000,"messages":[{"role":"user","content":"hi"}]}`)
+	out, fields := DegradeAnthropicRequestParams(body, "claude-opus-4-7")
+
+	hasBudgetField := false
+	for _, f := range fields {
+		if f == "thinking_budget:rectified_vs_max_tokens" {
+			hasBudgetField = true
+		}
+	}
+	if !hasBudgetField {
+		t.Fatalf("expected thinking_budget:rectified_vs_max_tokens in degraded fields, got %v", fields)
+	}
+	b := gjson.GetBytes(out, "thinking.budget_tokens").Int()
+	m := gjson.GetBytes(out, "max_tokens").Int()
+	if m <= b {
+		t.Fatalf("pipeline 整流后仍违规: max_tokens=%d <= budget_tokens=%d", m, b)
+	}
+}
