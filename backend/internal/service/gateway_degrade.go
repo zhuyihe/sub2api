@@ -21,9 +21,11 @@ import (
 const placeholderOrphanToolUseName = "_gateway_orphan_tool_use_placeholder"
 
 // pairOrphanToolResults 修复"unexpected tool_use_id"对话完整性错误：扫描每条消息
-// 的 tool_result 块，若其 tool_use_id 在所有之前的 assistant 消息的 tool_use 块中
-// 未声明，则在最近的前置 assistant 消息 content 末尾追加一个 id 匹配的占位 tool_use。
-// 有损：注入占位 tool_use(name 为标记常量),改变了对话历史的完整性,
+// 的 tool_result 块，若其 tool_use_id 在「紧邻前一条 assistant 消息」的 tool_use
+// 块中未声明，则在该 assistant 消息 content 末尾追加 id 匹配的占位 tool_use。
+// 注：Anthropic 上游严格要求 tool_result 对应紧邻 "previous message" 的 tool_use；
+// 即使早期某条 assistant 声明过同名 tool_use，跨越后再次引用也会触发 400。
+// 有损：注入占位 tool_use(name 为标记常量)，改变了对话历史的完整性，
 // 但保留客户端的 tool_result 数据(不丢失工具调用结果)。
 func pairOrphanToolResults(body []byte) ([]byte, bool) {
 	if !bytes.Contains(body, []byte("tool_result")) ||
@@ -56,7 +58,7 @@ func pairOrphanToolResults(body []byte) ([]byte, bool) {
 }
 
 // orphanToolUseIDsInMessage 返回 messages[i] 中所有 tool_result 块引用的、
-// 在 messages[0..i-1] 的 assistant 消息中未声明的 tool_use_id 列表。
+// 在「紧邻前一条 assistant 消息」的 tool_use 块中未声明的 tool_use_id 列表。
 func orphanToolUseIDsInMessage(messages []any, i int) []string {
 	curr, ok := messages[i].(map[string]any)
 	if !ok {
@@ -66,7 +68,7 @@ func orphanToolUseIDsInMessage(messages []any, i int) []string {
 	if !ok {
 		return nil
 	}
-	declared := collectDeclaredToolUseIDs(messages, i)
+	declared := declaredToolUseIDsInPrevAssistant(messages, i)
 	var orphans []string
 	for _, blk := range contentArr {
 		bm, ok := blk.(map[string]any)
@@ -82,27 +84,31 @@ func orphanToolUseIDsInMessage(messages []any, i int) []string {
 	return orphans
 }
 
-// collectDeclaredToolUseIDs 收集 messages[0..beforeIdx-1] 中所有 assistant 消息
-// 的 tool_use 块 id。
-func collectDeclaredToolUseIDs(messages []any, beforeIdx int) map[string]bool {
+// declaredToolUseIDsInPrevAssistant 收集紧邻 messages[i] 前一条 assistant 消息
+// 的 tool_use 块 id 集合。无紧邻 assistant 时返回空集合。
+// 这里刻意「只看紧邻」而非「所有前置」：Anthropic 严格按 previous message 校验，
+// 跨越中间消息的早期 tool_use 不算数（否则会触发上游 400）。
+func declaredToolUseIDsInPrevAssistant(messages []any, i int) map[string]bool {
 	declared := map[string]bool{}
-	for j := 0; j < beforeIdx; j++ {
-		pm, ok := messages[j].(map[string]any)
-		if !ok || pm["role"] != "assistant" {
+	prevIdx := findPrevAssistantIdx(messages, i)
+	if prevIdx < 0 {
+		return declared
+	}
+	pm, ok := messages[prevIdx].(map[string]any)
+	if !ok {
+		return declared
+	}
+	pContent, ok := pm["content"].([]any)
+	if !ok {
+		return declared
+	}
+	for _, pb := range pContent {
+		pbm, ok := pb.(map[string]any)
+		if !ok || pbm["type"] != "tool_use" {
 			continue
 		}
-		pContent, ok := pm["content"].([]any)
-		if !ok {
-			continue
-		}
-		for _, pb := range pContent {
-			pbm, ok := pb.(map[string]any)
-			if !ok || pbm["type"] != "tool_use" {
-				continue
-			}
-			if id, ok := pbm["id"].(string); ok {
-				declared[id] = true
-			}
+		if id, ok := pbm["id"].(string); ok {
+			declared[id] = true
 		}
 	}
 	return declared

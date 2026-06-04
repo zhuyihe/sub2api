@@ -96,6 +96,40 @@ func TestPairOrphanToolResults(t *testing.T) {
 	}
 }
 
+// TestPairOrphanToolResults_CrossAssistantReference 复现 user 104 实际 400：
+// 早期 assistant 声明过 tool_use，但紧邻前一条 assistant 未声明同名 tool_use，
+// 再次出现的 tool_result 必须被视为孤儿（Anthropic 严格按 previous message 校验）。
+func TestPairOrphanToolResults_CrossAssistantReference(t *testing.T) {
+	body := `{"messages":[
+		{"role":"user","content":"hi"},
+		{"role":"assistant","content":[{"type":"tool_use","id":"toolu_A","name":"x","input":{}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_A","content":"ok"}]},
+		{"role":"assistant","content":[{"type":"text","text":"done"}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_A","content":"再次引用"}]}
+	]}`
+	out, ok := pairOrphanToolResults([]byte(body))
+	if !ok {
+		t.Fatal("expected pair: 跨越中间 assistant 的 tool_use 引用应判为孤儿")
+	}
+	// messages[3](紧邻 messages[4] 的 assistant) 末尾应被追加占位 tool_use A
+	blocks := gjson.GetBytes(out, "messages.3.content").Array()
+	if len(blocks) != 2 {
+		t.Fatalf("messages[3].content blocks=%d, want 2(原 text+占位 tool_use)", len(blocks))
+	}
+	added := blocks[1]
+	if added.Get("type").String() != "tool_use" || added.Get("id").String() != "toolu_A" {
+		t.Fatalf("placeholder tool_use 不正确: %s", added.Raw)
+	}
+	if added.Get("name").String() != placeholderOrphanToolUseName {
+		t.Fatal("placeholder name 不匹配")
+	}
+	// messages[1] 原 tool_use 不动
+	orig := gjson.GetBytes(out, "messages.1.content.0")
+	if orig.Get("name").String() == placeholderOrphanToolUseName {
+		t.Fatal("原 messages[1] 的 tool_use 被误改")
+	}
+}
+
 func TestNormalizeCacheControlTTL(t *testing.T) {
 	body := `{"messages":[{"role":"user","content":[
 		{"type":"text","text":"a","cache_control":{"type":"ephemeral","ttl":"1h"}},
