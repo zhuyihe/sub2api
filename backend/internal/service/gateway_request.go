@@ -1180,11 +1180,15 @@ const (
 )
 
 // isThinkingBudgetConstraintError detects whether an upstream error message indicates
-// a budget_tokens constraint violation (e.g. "budget_tokens >= 1024").
-// Matches three conditions (all must be true):
+// a budget_tokens constraint violation. Two flavours are covered:
+//   - flavour A: thinking.budget_tokens 太小（最低 1024），上游报 ">= 1024" / "input should be ..1024.."。
+//   - flavour B: max_tokens ≤ thinking.budget_tokens，上游报
+//     "max_tokens must be greater than thinking.budget_tokens"。
+//
+// All three conditions must be true to return true:
 //  1. Contains "budget_tokens" or "budget tokens"
-//  2. Contains "thinking"
-//  3. Contains ">= 1024" or "greater than or equal to 1024" or ("1024" + "input should be")
+//  2. Contains "thinking" (URL fragment `extended-thinking` 也算)
+//  3. Matches one of the flavour A / B 指示符
 func isThinkingBudgetConstraintError(errMsg string) bool {
 	m := strings.ToLower(errMsg)
 
@@ -1199,11 +1203,16 @@ func isThinkingBudgetConstraintError(errMsg string) bool {
 		return false
 	}
 
-	// Condition 3: constraint indicator
+	// Condition 3a: budget 太小（最低 1024）
 	if strings.Contains(m, ">= 1024") || strings.Contains(m, "greater than or equal to 1024") {
 		return true
 	}
 	if strings.Contains(m, "1024") && strings.Contains(m, "input should be") {
+		return true
+	}
+	// Condition 3b: max_tokens ≤ budget_tokens（约束 max_tokens 必须严格大于 budget）。
+	// Anthropic 原文: "`max_tokens` must be greater than `thinking.budget_tokens`"
+	if strings.Contains(m, "max_tokens") && strings.Contains(m, "greater than") {
 		return true
 	}
 
