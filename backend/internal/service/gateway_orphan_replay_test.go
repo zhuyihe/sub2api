@@ -1,6 +1,8 @@
 package service
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/tidwall/gjson"
@@ -54,5 +56,101 @@ func TestPairOrphanToolResults_ProductionReplay(t *testing.T) {
 				t.Fatalf("messages.2.content.0.type=%q, want text", typ)
 			}
 		})
+	}
+}
+
+// TestDegradeAnthropicRequestParams_TruncateThenOrphan 复现 user 104 真实 case：
+// body 含合法配对 + 整体超过 maxPromptBodyBytes (650KB)，触发 truncateOversizedPrompt
+// 从尾部保留消息。截断丢掉了原本声明 tool_use 的 assistant 消息，留下的 tool_result
+// 在新 messages[1] 中找不到对应 tool_use → 必须 step 13a 再跑一次 pairOrphanToolResults
+// 把孤儿转 text 块，否则上游 400。
+//
+// 构造方法：制造一个 ~1MB 的对话，结尾恰好留下「孤儿 tool_result + 截断前合法
+// 的早期 tool_use」。验证最终结果里 tool_result 已被转 text 块（不再有 tool_use_id）。
+func TestDegradeAnthropicRequestParams_TruncateThenOrphan(t *testing.T) {
+	// 制造一条 50KB 的填充文本，让前几轮消息体积膨胀
+	filler := strings.Repeat("x", 50*1024)
+
+	// 26 轮 user/assistant 配对，每轮 ~100KB → 总 ~2.6MB，远超 650KB 阈值
+	var msgs []string
+	for i := 0; i < 26; i++ {
+		toolID := fmt.Sprintf("toolu_orphan_round_%02d", i)
+		msgs = append(msgs,
+			fmt.Sprintf(`{"role":"user","content":[{"type":"text","text":%q}]}`, filler),
+			fmt.Sprintf(`{"role":"assistant","content":[{"type":"tool_use","id":%q,"name":"x","input":{}}]}`, toolID),
+			fmt.Sprintf(`{"role":"user","content":[{"type":"tool_result","tool_use_id":%q,"content":"early result"}]}`, toolID),
+		)
+	}
+	// 末尾再追加最近一轮（这一轮应在截断后保留）
+	finalToolID := "toolu_final_ROUND"
+	msgs = append(msgs,
+		fmt.Sprintf(`{"role":"assistant","content":[{"type":"text","text":"thinking"},{"type":"tool_use","id":%q,"name":"x","input":{}}]}`, finalToolID),
+		fmt.Sprintf(`{"role":"user","content":[{"type":"tool_result","tool_use_id":%q,"content":"final ok"}]}`, finalToolID),
+	)
+	body := []byte(fmt.Sprintf(`{"model":"claude-opus-4-7","max_tokens":1024,"messages":[%s]}`, strings.Join(msgs, ",")))
+
+	if len(body) <= maxPromptBodyBytes {
+		t.Fatalf("test setup error: body_len=%d not exceeding maxPromptBodyBytes=%d", len(body), maxPromptBodyBytes)
+	}
+
+	out, fields := DegradeAnthropicRequestParams(body, "claude-opus-4-7")
+
+	// 确认 oversized_prompt:truncated 触发了
+	hasTrunc := false
+	hasPostTruncPair := false
+	for _, f := range fields {
+		if f == "oversized_prompt:truncated" {
+			hasTrunc = true
+		}
+		if f == "orphan_tool_result:post_truncate_paired" {
+			hasPostTruncPair = true
+		}
+	}
+	if !hasTrunc {
+		t.Fatalf("expected oversized_prompt:truncated in degraded fields, got %v", fields)
+	}
+	if !hasPostTruncPair {
+		t.Fatalf("expected orphan_tool_result:post_truncate_paired (step 13a) in degraded fields, got %v", fields)
+	}
+
+	// 截断后的 messages 中所有 tool_result 块都必须有合法 prev assistant 的 tool_use
+	// 配对，否则上游 400。简化校验：扫每条含 tool_result 的 user 消息，确认其 tool_use_id
+	// 在紧邻前一条 assistant 中声明了。
+	msgsArr := gjson.GetBytes(out, "messages").Array()
+	if len(msgsArr) < 2 {
+		t.Fatalf("messages after degrade len=%d, too few", len(msgsArr))
+	}
+	for i := 1; i < len(msgsArr); i++ {
+		curr := msgsArr[i]
+		if curr.Get("role").String() != "user" {
+			continue
+		}
+		content := curr.Get("content")
+		if !content.IsArray() {
+			continue
+		}
+		for _, blk := range content.Array() {
+			if blk.Get("type").String() != "tool_result" {
+				continue
+			}
+			id := blk.Get("tool_use_id").String()
+			// 紧邻前一条 assistant 必须声明这个 tool_use_id
+			prev := msgsArr[i-1]
+			if prev.Get("role").String() != "assistant" {
+				t.Fatalf("orphan tool_result at messages[%d] (id=%s): prev role=%s not assistant",
+					i, id, prev.Get("role").String())
+			}
+			found := false
+			for _, pb := range prev.Get("content").Array() {
+				if pb.Get("type").String() == "tool_use" && pb.Get("id").String() == id {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("orphan tool_result at messages[%d] (id=%s): not declared in prev assistant",
+					i, id, )
+			}
+		}
 	}
 }
