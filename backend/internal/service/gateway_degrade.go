@@ -17,37 +17,35 @@ import (
 	_ "golang.org/x/image/webp" // 注册 webp 解码器
 )
 
-// placeholderOrphanToolUseName 标记由网关为孤儿 tool_result 补齐的占位工具调用。
-const placeholderOrphanToolUseName = "_gateway_orphan_tool_use_placeholder"
+// orphanToolResultTextPrefix 是把孤儿 tool_result 块转换为 text 块时的前缀模板。
+// 出现在最终 text 字段里，便于在日志/客户端响应中识别为网关改写。
+const orphanToolResultTextPrefix = "[tool_result "
 
-// pairOrphanToolResults 修复"unexpected tool_use_id"对话完整性错误：扫描每条消息
+// pairOrphanToolResults 修复"unexpected tool_use_id"对话完整性错误：扫描全部消息
 // 的 tool_result 块，若其 tool_use_id 在「紧邻前一条 assistant 消息」的 tool_use
-// 块中未声明，则在该 assistant 消息 content 末尾追加 id 匹配的占位 tool_use。
+// 块中未声明，则把该 tool_result 块就地替换为 text 块，保留原文本内容。
+//
 // 注：Anthropic 上游严格要求 tool_result 对应紧邻 "previous message" 的 tool_use；
-// 即使早期某条 assistant 声明过同名 tool_use，跨越后再次引用也会触发 400。
-// 有损：注入占位 tool_use(name 为标记常量)，改变了对话历史的完整性，
-// 但保留客户端的 tool_result 数据(不丢失工具调用结果)。
+// 即使早期某条 assistant 声明过同名 tool_use，跨越后再次引用也会触发 400；
+// 若孤儿 tool_result 出现在 messages[0]，根本没有可挂的 assistant。
+// 统一转为 text 块的好处：不破坏 messages 长度/交替结构、永不为空、上游绝对接受。
+//
+// 有损：模型会把这段当成普通文字，无法识别为上一步工具调用的结果；
+// 但客户端的原始文本数据被完整保留在 text 字段中。
 func pairOrphanToolResults(body []byte) ([]byte, bool) {
 	if !bytes.Contains(body, []byte("tool_result")) ||
 		!bytes.Contains(body, []byte("tool_use_id")) {
 		return body, false
 	}
 	messages, ok := unmarshalMessages(body)
-	if !ok || len(messages) < 2 {
+	if !ok || len(messages) == 0 {
 		return body, false
 	}
 
 	changed := false
-	for i := 1; i < len(messages); i++ {
-		orphans := orphanToolUseIDsInMessage(messages, i)
-		if len(orphans) == 0 {
-			continue
-		}
-		prevIdx := findPrevAssistantIdx(messages, i)
-		if prevIdx < 0 {
-			continue
-		}
-		if appendPlaceholderToolUses(messages[prevIdx], orphans) {
+	for i := 0; i < len(messages); i++ {
+		declared := declaredToolUseIDsInPrevAssistant(messages, i)
+		if convertOrphansToText(messages[i], declared) {
 			changed = true
 		}
 	}
@@ -57,31 +55,76 @@ func pairOrphanToolResults(body []byte) ([]byte, bool) {
 	return rewriteMessages(body, messages)
 }
 
-// orphanToolUseIDsInMessage 返回 messages[i] 中所有 tool_result 块引用的、
-// 在「紧邻前一条 assistant 消息」的 tool_use 块中未声明的 tool_use_id 列表。
-func orphanToolUseIDsInMessage(messages []any, i int) []string {
-	curr, ok := messages[i].(map[string]any)
+// convertOrphansToText 扫描 msg 的 content 数组，将所有 tool_use_id 不在 declared
+// 集合中的 tool_result 块就地替换为 text 块，返回是否实际改动过。
+// content 为字符串或缺省时直接返回 false（不可能有 tool_result 块）。
+func convertOrphansToText(msg any, declared map[string]bool) bool {
+	mm, ok := msg.(map[string]any)
 	if !ok {
-		return nil
+		return false
 	}
-	contentArr, ok := curr["content"].([]any)
+	contentArr, ok := mm["content"].([]any)
 	if !ok {
-		return nil
+		return false
 	}
-	declared := declaredToolUseIDsInPrevAssistant(messages, i)
-	var orphans []string
-	for _, blk := range contentArr {
+	changed := false
+	for idx, blk := range contentArr {
 		bm, ok := blk.(map[string]any)
 		if !ok || bm["type"] != "tool_result" {
 			continue
 		}
-		id, ok := bm["tool_use_id"].(string)
-		if !ok || id == "" || declared[id] {
+		id, _ := bm["tool_use_id"].(string)
+		if id != "" && declared[id] {
+			continue // 合法 tool_result：保留
+		}
+		contentArr[idx] = buildTextBlockFromToolResult(id, bm["content"])
+		changed = true
+	}
+	if changed {
+		mm["content"] = contentArr
+	}
+	return changed
+}
+
+// buildTextBlockFromToolResult 把一个孤儿 tool_result 块的原 content（可能是
+// 字符串 / 内容块数组 / 缺省）抽出可读文本，包装为 {type:text, text:<...>}。
+// 保证 text 字段非空：缺省情况兜底为 "[tool_result <id>]" 标记。
+func buildTextBlockFromToolResult(id string, content any) map[string]any {
+	prefix := orphanToolResultTextPrefix + id + "]"
+	switch v := content.(type) {
+	case string:
+		if v == "" {
+			return map[string]any{"type": "text", "text": prefix}
+		}
+		return map[string]any{"type": "text", "text": prefix + " " + v}
+	case []any:
+		text := extractTextFromBlocks(v)
+		if text == "" {
+			return map[string]any{"type": "text", "text": prefix + " (non-text content omitted)"}
+		}
+		return map[string]any{"type": "text", "text": prefix + " " + text}
+	default:
+		return map[string]any{"type": "text", "text": prefix}
+	}
+}
+
+// extractTextFromBlocks 从 tool_result.content 块数组中拼接所有 type=="text" 子块的
+// text 字段；非文本块（image/document 等）会被跳过（不丢错，仅丢内容）。
+func extractTextFromBlocks(blocks []any) string {
+	var parts []string
+	for _, b := range blocks {
+		bm, ok := b.(map[string]any)
+		if !ok {
 			continue
 		}
-		orphans = append(orphans, id)
+		if bm["type"] != "text" {
+			continue
+		}
+		if s, ok := bm["text"].(string); ok && s != "" {
+			parts = append(parts, s)
+		}
 	}
-	return orphans
+	return strings.Join(parts, "\n")
 }
 
 // declaredToolUseIDsInPrevAssistant 收集紧邻 messages[i] 前一条 assistant 消息
@@ -123,35 +166,6 @@ func findPrevAssistantIdx(messages []any, i int) int {
 		}
 	}
 	return -1
-}
-
-// appendPlaceholderToolUses 向给定 assistant 消息的 content 末尾追加占位 tool_use
-// 块（对每个 id 各一个）。若 content 当前是字符串，先转成包含原文本的内容块数组。
-// 返回是否实际修改了消息。
-func appendPlaceholderToolUses(msg any, ids []string) bool {
-	prev, ok := msg.(map[string]any)
-	if !ok {
-		return false
-	}
-	var prevContent []any
-	switch c := prev["content"].(type) {
-	case []any:
-		prevContent = c
-	case string:
-		prevContent = []any{map[string]any{"type": "text", "text": c}}
-	default:
-		return false
-	}
-	for _, id := range ids {
-		prevContent = append(prevContent, map[string]any{
-			"type":  "tool_use",
-			"id":    id,
-			"name":  placeholderOrphanToolUseName,
-			"input": map[string]any{},
-		})
-	}
-	prev["content"] = prevContent
-	return true
 }
 
 // normalizeToolFunctionType 删除 tools[i].type == "function" 字段（OpenAI schema 误用）。

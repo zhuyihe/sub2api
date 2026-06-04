@@ -70,19 +70,23 @@ func TestPairOrphanToolResults(t *testing.T) {
 	]}`
 	out, ok := pairOrphanToolResults([]byte(body))
 	if !ok {
-		t.Fatal("expected pair")
+		t.Fatal("expected change")
 	}
-	// messages[1].content 末尾应有 tool_use id 匹配
-	blocks := gjson.GetBytes(out, "messages.1.content").Array()
-	if len(blocks) != 2 {
-		t.Fatalf("messages[1].content blocks=%d, want 2(原 text+占位 tool_use)", len(blocks))
+	// 孤儿 tool_result 应就地转 text 块；位置 (messages[2].content[0]) 与数组长度不变
+	block := gjson.GetBytes(out, "messages.2.content.0")
+	if block.Get("type").String() != "text" {
+		t.Fatalf("expected type=text, got %s", block.Get("type").String())
 	}
-	added := blocks[1]
-	if added.Get("type").String() != "tool_use" || added.Get("id").String() != "toolu_orphan_1" {
-		t.Fatalf("placeholder tool_use 不正确: %s", added.Raw)
+	want := "[tool_result toolu_orphan_1] x"
+	if got := block.Get("text").String(); got != want {
+		t.Fatalf("text=%q, want %q", got, want)
 	}
-	if added.Get("name").String() != placeholderOrphanToolUseName {
-		t.Fatal("placeholder name 不匹配")
+	if n := len(gjson.GetBytes(out, "messages.2.content").Array()); n != 1 {
+		t.Fatalf("content blocks=%d, want 1 (原地替换不改长度)", n)
+	}
+	// messages[1] 原 assistant 文本不应被改动（不再注入占位 tool_use）
+	if n := len(gjson.GetBytes(out, "messages.1.content").Array()); n != 1 {
+		t.Fatalf("messages[1].content blocks=%d, want 1 (不应追加占位)", n)
 	}
 
 	// 已正确配对时不动
@@ -99,6 +103,7 @@ func TestPairOrphanToolResults(t *testing.T) {
 // TestPairOrphanToolResults_CrossAssistantReference 复现 user 104 实际 400：
 // 早期 assistant 声明过 tool_use，但紧邻前一条 assistant 未声明同名 tool_use，
 // 再次出现的 tool_result 必须被视为孤儿（Anthropic 严格按 previous message 校验）。
+// 修复后：孤儿就地转 text 块，messages[1] 的原 tool_use 不被改动。
 func TestPairOrphanToolResults_CrossAssistantReference(t *testing.T) {
 	body := `{"messages":[
 		{"role":"user","content":"hi"},
@@ -109,24 +114,131 @@ func TestPairOrphanToolResults_CrossAssistantReference(t *testing.T) {
 	]}`
 	out, ok := pairOrphanToolResults([]byte(body))
 	if !ok {
-		t.Fatal("expected pair: 跨越中间 assistant 的 tool_use 引用应判为孤儿")
+		t.Fatal("expected change: 跨越中间 assistant 的 tool_use 引用应判为孤儿")
 	}
-	// messages[3](紧邻 messages[4] 的 assistant) 末尾应被追加占位 tool_use A
-	blocks := gjson.GetBytes(out, "messages.3.content").Array()
-	if len(blocks) != 2 {
-		t.Fatalf("messages[3].content blocks=%d, want 2(原 text+占位 tool_use)", len(blocks))
+	// messages[2] 的 tool_result 合法（紧邻 messages[1] 声明 toolu_A），保留不动
+	mid := gjson.GetBytes(out, "messages.2.content.0")
+	if mid.Get("type").String() != "tool_result" {
+		t.Fatalf("messages[2].content[0] 应保留 tool_result，got %s", mid.Raw)
 	}
-	added := blocks[1]
-	if added.Get("type").String() != "tool_use" || added.Get("id").String() != "toolu_A" {
-		t.Fatalf("placeholder tool_use 不正确: %s", added.Raw)
+	// messages[4] 的 tool_result 在紧邻 messages[3] 中无声明 → 转 text
+	tail := gjson.GetBytes(out, "messages.4.content.0")
+	if tail.Get("type").String() != "text" {
+		t.Fatalf("messages[4].content[0] 应转 text，got %s", tail.Raw)
 	}
-	if added.Get("name").String() != placeholderOrphanToolUseName {
-		t.Fatal("placeholder name 不匹配")
+	want := "[tool_result toolu_A] 再次引用"
+	if got := tail.Get("text").String(); got != want {
+		t.Fatalf("text=%q, want %q", got, want)
 	}
-	// messages[1] 原 tool_use 不动
-	orig := gjson.GetBytes(out, "messages.1.content.0")
-	if orig.Get("name").String() == placeholderOrphanToolUseName {
-		t.Fatal("原 messages[1] 的 tool_use 被误改")
+	// messages[1] 原 tool_use 不动（不再追加占位）
+	if n := len(gjson.GetBytes(out, "messages.1.content").Array()); n != 1 {
+		t.Fatalf("messages[1].content blocks=%d, want 1", n)
+	}
+	// messages[3] 原 assistant text 不动
+	if n := len(gjson.GetBytes(out, "messages.3.content").Array()); n != 1 {
+		t.Fatalf("messages[3].content blocks=%d, want 1", n)
+	}
+}
+
+// TestPairOrphanToolResults_OrphanInMessages0 复现 12:55:43 实际 400：
+// 孤儿 tool_result 出现在 messages[0]，根本没有可挂的前置消息。
+// 修复后：i=0 也进入循环，就地转 text。
+func TestPairOrphanToolResults_OrphanInMessages0(t *testing.T) {
+	body := `{"messages":[
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01UGnaFy","content":"early result"}]},
+		{"role":"assistant","content":[{"type":"text","text":"ok"}]}
+	]}`
+	out, ok := pairOrphanToolResults([]byte(body))
+	if !ok {
+		t.Fatal("expected change: messages[0] 孤儿 tool_result 必须被转换")
+	}
+	block := gjson.GetBytes(out, "messages.0.content.0")
+	if block.Get("type").String() != "text" {
+		t.Fatalf("expected type=text, got %s", block.Get("type").String())
+	}
+	want := "[tool_result toolu_01UGnaFy] early result"
+	if got := block.Get("text").String(); got != want {
+		t.Fatalf("text=%q, want %q", got, want)
+	}
+}
+
+// TestPairOrphanToolResults_NoAssistantSequence 复现非交替序列：
+// messages 全是 user，i=2 含孤儿 tool_result。修复后：转 text，不破坏长度。
+func TestPairOrphanToolResults_NoAssistantSequence(t *testing.T) {
+	body := `{"messages":[
+		{"role":"user","content":"hi"},
+		{"role":"user","content":"again"},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_X","content":"orphan"}]}
+	]}`
+	out, ok := pairOrphanToolResults([]byte(body))
+	if !ok {
+		t.Fatal("expected change: 无 assistant 序列中的孤儿应转 text")
+	}
+	block := gjson.GetBytes(out, "messages.2.content.0")
+	if block.Get("type").String() != "text" {
+		t.Fatalf("expected type=text, got %s", block.Get("type").String())
+	}
+	if got := block.Get("text").String(); got != "[tool_result toolu_X] orphan" {
+		t.Fatalf("text=%q", got)
+	}
+}
+
+// TestPairOrphanToolResults_ContentVariants 覆盖 tool_result.content 的多种形态：
+// 字符串 / 文本块数组 / 含图像块 / 缺省。
+func TestPairOrphanToolResults_ContentVariants(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{
+			name: "content 是块数组（多个 text 块拼接）",
+			body: `{"messages":[{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"id1","content":[
+					{"type":"text","text":"line1"},
+					{"type":"text","text":"line2"}
+				]}
+			]}]}`,
+			want: "[tool_result id1] line1\nline2",
+		},
+		{
+			name: "content 含 image 块（兜底 non-text content omitted）",
+			body: `{"messages":[{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"id2","content":[
+					{"type":"image","source":{"type":"base64","data":"xx"}}
+				]}
+			]}]}`,
+			want: "[tool_result id2] (non-text content omitted)",
+		},
+		{
+			name: "content 缺省（兜底标记）",
+			body: `{"messages":[{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"id3"}
+			]}]}`,
+			want: "[tool_result id3]",
+		},
+		{
+			name: "content 为空字符串（兜底标记，不带空格）",
+			body: `{"messages":[{"role":"user","content":[
+				{"type":"tool_result","tool_use_id":"id4","content":""}
+			]}]}`,
+			want: "[tool_result id4]",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out, ok := pairOrphanToolResults([]byte(tt.body))
+			if !ok {
+				t.Fatal("expected change")
+			}
+			block := gjson.GetBytes(out, "messages.0.content.0")
+			if block.Get("type").String() != "text" {
+				t.Fatalf("type=%s, want text", block.Get("type").String())
+			}
+			if got := block.Get("text").String(); got != tt.want {
+				t.Fatalf("text=%q, want %q", got, tt.want)
+			}
+		})
 	}
 }
 
