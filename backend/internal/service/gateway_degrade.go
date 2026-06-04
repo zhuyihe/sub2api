@@ -17,6 +17,137 @@ import (
 	_ "golang.org/x/image/webp" // 注册 webp 解码器
 )
 
+// placeholderOrphanToolUseName 标记由网关为孤儿 tool_result 补齐的占位工具调用。
+const placeholderOrphanToolUseName = "_gateway_orphan_tool_use_placeholder"
+
+// pairOrphanToolResults 修复"unexpected tool_use_id"对话完整性错误：扫描每条消息
+// 的 tool_result 块，若其 tool_use_id 在所有之前的 assistant 消息的 tool_use 块中
+// 未声明，则在最近的前置 assistant 消息 content 末尾追加一个 id 匹配的占位 tool_use。
+// 有损：注入占位 tool_use(name 为标记常量),改变了对话历史的完整性,
+// 但保留客户端的 tool_result 数据(不丢失工具调用结果)。
+func pairOrphanToolResults(body []byte) ([]byte, bool) {
+	if !bytes.Contains(body, []byte("tool_result")) ||
+		!bytes.Contains(body, []byte("tool_use_id")) {
+		return body, false
+	}
+	messages, ok := unmarshalMessages(body)
+	if !ok || len(messages) < 2 {
+		return body, false
+	}
+
+	changed := false
+	for i := 1; i < len(messages); i++ {
+		orphans := orphanToolUseIDsInMessage(messages, i)
+		if len(orphans) == 0 {
+			continue
+		}
+		prevIdx := findPrevAssistantIdx(messages, i)
+		if prevIdx < 0 {
+			continue
+		}
+		if appendPlaceholderToolUses(messages[prevIdx], orphans) {
+			changed = true
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	return rewriteMessages(body, messages)
+}
+
+// orphanToolUseIDsInMessage 返回 messages[i] 中所有 tool_result 块引用的、
+// 在 messages[0..i-1] 的 assistant 消息中未声明的 tool_use_id 列表。
+func orphanToolUseIDsInMessage(messages []any, i int) []string {
+	curr, ok := messages[i].(map[string]any)
+	if !ok {
+		return nil
+	}
+	contentArr, ok := curr["content"].([]any)
+	if !ok {
+		return nil
+	}
+	declared := collectDeclaredToolUseIDs(messages, i)
+	var orphans []string
+	for _, blk := range contentArr {
+		bm, ok := blk.(map[string]any)
+		if !ok || bm["type"] != "tool_result" {
+			continue
+		}
+		id, ok := bm["tool_use_id"].(string)
+		if !ok || id == "" || declared[id] {
+			continue
+		}
+		orphans = append(orphans, id)
+	}
+	return orphans
+}
+
+// collectDeclaredToolUseIDs 收集 messages[0..beforeIdx-1] 中所有 assistant 消息
+// 的 tool_use 块 id。
+func collectDeclaredToolUseIDs(messages []any, beforeIdx int) map[string]bool {
+	declared := map[string]bool{}
+	for j := 0; j < beforeIdx; j++ {
+		pm, ok := messages[j].(map[string]any)
+		if !ok || pm["role"] != "assistant" {
+			continue
+		}
+		pContent, ok := pm["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, pb := range pContent {
+			pbm, ok := pb.(map[string]any)
+			if !ok || pbm["type"] != "tool_use" {
+				continue
+			}
+			if id, ok := pbm["id"].(string); ok {
+				declared[id] = true
+			}
+		}
+	}
+	return declared
+}
+
+// findPrevAssistantIdx 从 i-1 向前查找最近的 assistant 消息下标，找不到返回 -1。
+func findPrevAssistantIdx(messages []any, i int) int {
+	for j := i - 1; j >= 0; j-- {
+		pm, ok := messages[j].(map[string]any)
+		if ok && pm["role"] == "assistant" {
+			return j
+		}
+	}
+	return -1
+}
+
+// appendPlaceholderToolUses 向给定 assistant 消息的 content 末尾追加占位 tool_use
+// 块（对每个 id 各一个）。若 content 当前是字符串，先转成包含原文本的内容块数组。
+// 返回是否实际修改了消息。
+func appendPlaceholderToolUses(msg any, ids []string) bool {
+	prev, ok := msg.(map[string]any)
+	if !ok {
+		return false
+	}
+	var prevContent []any
+	switch c := prev["content"].(type) {
+	case []any:
+		prevContent = c
+	case string:
+		prevContent = []any{map[string]any{"type": "text", "text": c}}
+	default:
+		return false
+	}
+	for _, id := range ids {
+		prevContent = append(prevContent, map[string]any{
+			"type":  "tool_use",
+			"id":    id,
+			"name":  placeholderOrphanToolUseName,
+			"input": map[string]any{},
+		})
+	}
+	prev["content"] = prevContent
+	return true
+}
+
 // normalizeToolFunctionType 删除 tools[i].type == "function" 字段（OpenAI schema 误用）。
 // Anthropic 仅接受预定义工具 type 白名单(bash/code_execution/text_editor/web_fetch 等)
 // 或省略 type 让其默认为 custom。删除该字段即让客户端定义的工具按 custom 处理。

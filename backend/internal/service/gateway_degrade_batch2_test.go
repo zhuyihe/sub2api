@@ -61,6 +61,41 @@ func TestAppendUserForAssistantPrefill(t *testing.T) {
 	}
 }
 
+func TestPairOrphanToolResults(t *testing.T) {
+	// messages[1](assistant) 无 tool_use; messages[2](user) 含孤儿 tool_result
+	body := `{"messages":[
+		{"role":"user","content":"hi"},
+		{"role":"assistant","content":[{"type":"text","text":"thinking..."}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_orphan_1","content":"x"}]}
+	]}`
+	out, ok := pairOrphanToolResults([]byte(body))
+	if !ok {
+		t.Fatal("expected pair")
+	}
+	// messages[1].content 末尾应有 tool_use id 匹配
+	blocks := gjson.GetBytes(out, "messages.1.content").Array()
+	if len(blocks) != 2 {
+		t.Fatalf("messages[1].content blocks=%d, want 2(原 text+占位 tool_use)", len(blocks))
+	}
+	added := blocks[1]
+	if added.Get("type").String() != "tool_use" || added.Get("id").String() != "toolu_orphan_1" {
+		t.Fatalf("placeholder tool_use 不正确: %s", added.Raw)
+	}
+	if added.Get("name").String() != placeholderOrphanToolUseName {
+		t.Fatal("placeholder name 不匹配")
+	}
+
+	// 已正确配对时不动
+	paired := `{"messages":[
+		{"role":"user","content":"hi"},
+		{"role":"assistant","content":[{"type":"tool_use","id":"toolu_A","name":"x","input":{}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_A","content":"x"}]}
+	]}`
+	if _, ok := pairOrphanToolResults([]byte(paired)); ok {
+		t.Fatal("已配对时不应改动")
+	}
+}
+
 func TestNormalizeCacheControlTTL(t *testing.T) {
 	body := `{"messages":[{"role":"user","content":[
 		{"type":"text","text":"a","cache_control":{"type":"ephemeral","ttl":"1h"}},
