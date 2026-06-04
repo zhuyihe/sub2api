@@ -1369,7 +1369,10 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 		degraded = append(degraded, "cache_control:trimmed")
 	}
 
-	// 8a. 孤儿 tool_result(对话完整性): 在前置 assistant 追加占位 tool_use 配对(有损)
+	// 8a. 孤儿 tool_result(对话完整性): 把跨越紧邻 assistant 的孤儿 tool_result
+	// 就地转 text 块。注意：truncateOversizedPrompt (第 13 步) 可能事后产生新的
+	// 孤儿（截断丢掉了原本声明 tool_use 的 assistant 消息），所以第 13 步后必须再
+	// 调用一次。这里这次主要处理客户端原本就存在的孤儿。
 	if next, ok := pairOrphanToolResults(out); ok {
 		out = next
 		degraded = append(degraded, "orphan_tool_result:paired")
@@ -1400,9 +1403,22 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 	}
 
 	// 13. body 过大 -> 截断最旧历史（有损，best-effort，可能误伤正常长对话）
+	truncated := false
 	if next, ok := truncateOversizedPrompt(out); ok {
 		out = next
+		truncated = true
 		degraded = append(degraded, "oversized_prompt:truncated")
+	}
+
+	// 13a. 截断后再次配对孤儿 tool_result：截断从尾部往前保留消息、丢弃最旧的
+	// assistant + tool_use 配对，导致原本合法的 tool_result 失去前置 tool_use 声明。
+	// 实测线上正是这一路径产生的 unexpected tool_use_id 400（user 104 case）。
+	// 只在确实截断过时再跑一次，避免重复无用工作。
+	if truncated {
+		if next, ok := pairOrphanToolResults(out); ok {
+			out = next
+			degraded = append(degraded, "orphan_tool_result:post_truncate_paired")
+		}
 	}
 
 	return out, degraded
