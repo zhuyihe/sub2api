@@ -38,6 +38,69 @@ func TestBackfillMissingTools(t *testing.T) {
 	}
 }
 
+// TestStripCacheControlOnDeferLoadingTools 复现生产 Account=44 的 400：
+// "Tool 'modify_mcp22' cannot have both defer_loading=true and cache_control set.
+// Tools with defer_loading cannot use prompt caching."
+// 工具同时带 defer_loading:true 与 cache_control 时上游直接拒；须删 cache_control
+// (仅缓存优化，删之对功能无损)、保留 defer_loading(功能性语义)。
+func TestStripCacheControlOnDeferLoadingTools(t *testing.T) {
+	t.Run("defer_loading+cache_control -> 删 cache_control", func(t *testing.T) {
+		body := `{"tools":[
+			{"name":"modify_mcp22","defer_loading":true,"cache_control":{"type":"ephemeral"},"input_schema":{"type":"object"}}
+		]}`
+		out, ok := stripCacheControlOnDeferLoadingTools([]byte(body))
+		if !ok {
+			t.Fatal("expected change")
+		}
+		if gjson.GetBytes(out, "tools.0.cache_control").Exists() {
+			t.Fatal("cache_control 应被删除")
+		}
+		if gjson.GetBytes(out, "tools.0.defer_loading").Bool() != true {
+			t.Fatal("defer_loading 应保留")
+		}
+		if gjson.GetBytes(out, "tools.0.name").String() != "modify_mcp22" {
+			t.Fatal("工具名应保留")
+		}
+	})
+
+	t.Run("仅 defer_loading 无 cache_control -> 不动", func(t *testing.T) {
+		body := `{"tools":[{"name":"t","defer_loading":true,"input_schema":{}}]}`
+		if _, ok := stripCacheControlOnDeferLoadingTools([]byte(body)); ok {
+			t.Fatal("无 cache_control 不应改动")
+		}
+	})
+
+	t.Run("有 cache_control 但 defer_loading 非 true -> 不动(缓存合法)", func(t *testing.T) {
+		body := `{"tools":[{"name":"t","cache_control":{"type":"ephemeral"},"input_schema":{}}]}`
+		if _, ok := stripCacheControlOnDeferLoadingTools([]byte(body)); ok {
+			t.Fatal("无 defer_loading 时 cache_control 合法，不应改动")
+		}
+	})
+
+	t.Run("混合: 仅清洗冲突项, 合法缓存工具保留", func(t *testing.T) {
+		body := `{"tools":[
+			{"name":"a","defer_loading":true,"cache_control":{"type":"ephemeral"}},
+			{"name":"b","cache_control":{"type":"ephemeral"}}
+		]}`
+		out, ok := stripCacheControlOnDeferLoadingTools([]byte(body))
+		if !ok {
+			t.Fatal("expected change")
+		}
+		if gjson.GetBytes(out, "tools.0.cache_control").Exists() {
+			t.Fatal("冲突项 a 的 cache_control 应删")
+		}
+		if !gjson.GetBytes(out, "tools.1.cache_control").Exists() {
+			t.Fatal("合法项 b 的 cache_control 应保留")
+		}
+	})
+
+	t.Run("无 tools 字段不变", func(t *testing.T) {
+		if _, ok := stripCacheControlOnDeferLoadingTools([]byte(`{"messages":[]}`)); ok {
+			t.Fatal("无 tools 不应改动")
+		}
+	})
+}
+
 func TestAppendUserForAssistantPrefill(t *testing.T) {
 	body := `{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"prefix"}]}`
 	out, ok := appendUserForAssistantPrefill([]byte(body))

@@ -59,6 +59,35 @@ func TestPairOrphanToolResults_ProductionReplay(t *testing.T) {
 	}
 }
 
+// TestPairOrphanToolResults_NonAdjacentPrev 复现生产 user 104 的
+// "messages.6.content.1: unexpected tool_use_id ... must have a corresponding
+// tool_use block in the previous message" 400。
+//
+// 拓扑：messages[3] 的 tool_result 紧邻前一条(messages[2])是另一条 user(非 assistant)，
+// 但更早的 assistant(messages[1])声明了同一 tool_use_id。旧实现经 findPrevAssistantIdx
+// 向前跳过非 assistant，命中早期 assistant 并误判「已声明→保留」；而 Anthropic 严格按
+// 紧邻前一条消息校验 → 上游 400。修复后须严格只看 messages[i-1]，把该孤儿转 text。
+func TestPairOrphanToolResults_NonAdjacentPrev(t *testing.T) {
+	body := `{"messages":[
+		{"role":"user","content":"hi"},
+		{"role":"assistant","content":[{"type":"tool_use","id":"toolu_01Mov","name":"x","input":{}}]},
+		{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_01Mov","content":"ok"}]},
+		{"role":"user","content":[{"type":"text","text":"continue"},{"type":"tool_result","tool_use_id":"toolu_01Mov","content":"dup"}]}
+	]}`
+	out, ok := pairOrphanToolResults([]byte(body))
+	if !ok {
+		t.Fatal("expected change: messages[3] 的 tool_result 紧邻前一条是 user，应判孤儿并转 text")
+	}
+	// messages[2] 合法配对(prev=messages[1] assistant 声明了 toolu_01Mov)，保留
+	if got := gjson.GetBytes(out, "messages.2.content.0.type").String(); got != "tool_result" {
+		t.Fatalf("messages[2] 合法 tool_result 应保留, got=%s", got)
+	}
+	// messages[3].content[1] 紧邻前一条是 user(messages[2])，按 Anthropic 应判孤儿 → text
+	if got := gjson.GetBytes(out, "messages.3.content.1.type").String(); got != "text" {
+		t.Fatalf("messages[3].content[1] 应转 text, got=%s", got)
+	}
+}
+
 // TestDegradeAnthropicRequestParams_TruncateThenOrphan 复现 user 104 真实 case：
 // body 含合法配对 + 整体超过 maxPromptBodyBytes (650KB)，触发 truncateOversizedPrompt
 // 从尾部保留消息。截断丢掉了原本声明 tool_use 的 assistant 消息，留下的 tool_result
@@ -149,7 +178,7 @@ func TestDegradeAnthropicRequestParams_TruncateThenOrphan(t *testing.T) {
 			}
 			if !found {
 				t.Fatalf("orphan tool_result at messages[%d] (id=%s): not declared in prev assistant",
-					i, id, )
+					i, id)
 			}
 		}
 	}

@@ -1405,6 +1405,13 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 		degraded = append(degraded, "tools_type_function:removed")
 	}
 
+	// 5b. tools[] 同时含 defer_loading:true 与 cache_control -> 删 cache_control
+	// (上游禁止 defer_loading 工具用 prompt caching，二者并存 400)
+	if next, ok := stripCacheControlOnDeferLoadingTools(out); ok {
+		out = next
+		degraded = append(degraded, "defer_loading_cache_control:stripped")
+	}
+
 	// 6. 图片 media_type 与真实格式不符 -> 修正
 	if next, ok := normalizeImageMediaType(out); ok {
 		out = next

@@ -127,18 +127,21 @@ func extractTextFromBlocks(blocks []any) string {
 	return strings.Join(parts, "\n")
 }
 
-// declaredToolUseIDsInPrevAssistant 收集紧邻 messages[i] 前一条 assistant 消息
-// 的 tool_use 块 id 集合。无紧邻 assistant 时返回空集合。
-// 这里刻意「只看紧邻」而非「所有前置」：Anthropic 严格按 previous message 校验，
-// 跨越中间消息的早期 tool_use 不算数（否则会触发上游 400）。
+// declaredToolUseIDsInPrevAssistant 收集 messages[i] 严格紧邻前一条消息(messages[i-1])
+// 中的 tool_use 块 id 集合。仅当 messages[i-1] 确为 assistant 时才收集，否则返回空集。
+//
+// 关键：必须「严格只看 i-1」而非「向前跳过非 assistant 找最近 assistant」。Anthropic
+// 按 previous message 位置校验 tool_result/tool_use 配对——若 i-1 是另一条 user(典型成因：
+// 客户端连发两条 user，或截断后相邻关系被破坏)，则更早 assistant 声明的 tool_use 不算数，
+// 此时 messages[i] 的 tool_result 即为孤儿。早期实现经 findPrevAssistantIdx 跳过 i-1 命中
+// 早期 assistant，会误判「已声明→保留」，正是线上 user 104 的 unexpected tool_use_id 400 根因。
 func declaredToolUseIDsInPrevAssistant(messages []any, i int) map[string]bool {
 	declared := map[string]bool{}
-	prevIdx := findPrevAssistantIdx(messages, i)
-	if prevIdx < 0 {
+	if i-1 < 0 {
 		return declared
 	}
-	pm, ok := messages[prevIdx].(map[string]any)
-	if !ok {
+	pm, ok := messages[i-1].(map[string]any)
+	if !ok || pm["role"] != "assistant" {
 		return declared
 	}
 	pContent, ok := pm["content"].([]any)
@@ -155,17 +158,6 @@ func declaredToolUseIDsInPrevAssistant(messages []any, i int) map[string]bool {
 		}
 	}
 	return declared
-}
-
-// findPrevAssistantIdx 从 i-1 向前查找最近的 assistant 消息下标，找不到返回 -1。
-func findPrevAssistantIdx(messages []any, i int) int {
-	for j := i - 1; j >= 0; j-- {
-		pm, ok := messages[j].(map[string]any)
-		if ok && pm["role"] == "assistant" {
-			return j
-		}
-	}
-	return -1
 }
 
 // orphanToolUseTextPrefix 是把孤儿 tool_use 块转换为 text 块时的前缀模板。
@@ -300,6 +292,48 @@ func normalizeToolFunctionType(body []byte) ([]byte, bool) {
 		}
 		if tm["type"] == "function" {
 			delete(tm, "type")
+			changed = true
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	tb, err := json.Marshal(tools)
+	if err != nil {
+		return body, false
+	}
+	out, err := sjson.SetRawBytes(body, "tools", tb)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+// stripCacheControlOnDeferLoadingTools 删除同时设置了 defer_loading:true 与 cache_control
+// 的工具上的 cache_control 字段。Anthropic 规定 defer_loading 工具不能用 prompt caching，
+// 二者并存触发 400("Tools with defer_loading cannot use prompt caching")。删 cache_control
+// (仅缓存优化)、保留 defer_loading(功能性语义)，对工具行为无损。
+func stripCacheControlOnDeferLoadingTools(body []byte) ([]byte, bool) {
+	if !bytes.Contains(body, []byte("defer_loading")) ||
+		!bytes.Contains(body, []byte("cache_control")) {
+		return body, false
+	}
+	toolsRes := gjson.GetBytes(body, "tools")
+	if !toolsRes.Exists() || !toolsRes.IsArray() {
+		return body, false
+	}
+	var tools []any
+	if err := json.Unmarshal(sliceRawFromBody(body, toolsRes), &tools); err != nil {
+		return body, false
+	}
+	changed := false
+	for _, t := range tools {
+		tm, ok := t.(map[string]any)
+		if !ok || tm["defer_loading"] != true {
+			continue
+		}
+		if _, has := tm["cache_control"]; has {
+			delete(tm, "cache_control")
 			changed = true
 		}
 	}
