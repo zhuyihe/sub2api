@@ -168,6 +168,114 @@ func findPrevAssistantIdx(messages []any, i int) int {
 	return -1
 }
 
+// orphanToolUseTextPrefix 是把孤儿 tool_use 块转换为 text 块时的前缀模板。
+const orphanToolUseTextPrefix = "[tool_use "
+
+// pairOrphanToolUses 修复 "tool_use ids were found without tool_result blocks
+// immediately after" 对话完整性错误：扫描 assistant 消息的 tool_use 块，若其 id
+// 未出现在「紧邻下一条消息」的 tool_result.tool_use_id 集合中，则把该 tool_use 块
+// 就地替换为 text 块，保留工具名与入参摘要。
+//
+// 与 pairOrphanToolResults 完全对称：后者看 prev assistant 的 tool_use 声明，
+// 前者看 next message 的 tool_result 回应。Anthropic 严格要求 assistant 的每个
+// tool_use 在紧邻下一条 user 消息里有对应 tool_result（典型成因：客户端在工具
+// 调用被中断时，把半截的 assistant turn 连同后续请求一并发出）。
+//
+// 有损：模型会把这段当成普通文字，无法识别为待执行的工具调用；但工具名/入参被
+// 完整保留在 text 字段中，不破坏 messages 长度/交替结构、永不为空、上游绝对接受。
+func pairOrphanToolUses(body []byte) ([]byte, bool) {
+	if !bytes.Contains(body, []byte("tool_use")) {
+		return body, false
+	}
+	messages, ok := unmarshalMessages(body)
+	if !ok || len(messages) == 0 {
+		return body, false
+	}
+
+	changed := false
+	for i := 0; i < len(messages); i++ {
+		mm, ok := messages[i].(map[string]any)
+		if !ok || mm["role"] != "assistant" {
+			continue
+		}
+		answered := answeredToolUseIDsInNextMessage(messages, i)
+		if convertOrphanToolUsesToText(mm, answered) {
+			changed = true
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	return rewriteMessages(body, messages)
+}
+
+// answeredToolUseIDsInNextMessage 收集「紧邻 messages[i] 下一条消息」中 tool_result
+// 块的 tool_use_id 集合。无下一条时返回空集合。只看紧邻下一条：Anthropic 严格按
+// next message 校验，跨越中间消息的后续 tool_result 不算数。
+func answeredToolUseIDsInNextMessage(messages []any, i int) map[string]bool {
+	answered := map[string]bool{}
+	if i+1 >= len(messages) {
+		return answered
+	}
+	nm, ok := messages[i+1].(map[string]any)
+	if !ok {
+		return answered
+	}
+	nContent, ok := nm["content"].([]any)
+	if !ok {
+		return answered
+	}
+	for _, nb := range nContent {
+		nbm, ok := nb.(map[string]any)
+		if !ok || nbm["type"] != "tool_result" {
+			continue
+		}
+		if id, ok := nbm["tool_use_id"].(string); ok {
+			answered[id] = true
+		}
+	}
+	return answered
+}
+
+// convertOrphanToolUsesToText 把 mm 中 id 不在 answered 集合的 tool_use 块就地替换
+// 为 text 块，返回是否实际改动过。content 非数组时直接返回 false。
+func convertOrphanToolUsesToText(mm map[string]any, answered map[string]bool) bool {
+	contentArr, ok := mm["content"].([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	for idx, blk := range contentArr {
+		bm, ok := blk.(map[string]any)
+		if !ok || bm["type"] != "tool_use" {
+			continue
+		}
+		id, _ := bm["id"].(string)
+		if id != "" && answered[id] {
+			continue // 已被紧邻下条回应：保留
+		}
+		contentArr[idx] = buildTextBlockFromToolUse(bm)
+		changed = true
+	}
+	if changed {
+		mm["content"] = contentArr
+	}
+	return changed
+}
+
+// buildTextBlockFromToolUse 把一个孤儿 tool_use 块抽取工具名与 input 摘要，包装为
+// {type:text, text:<...>}。保证 text 字段非空：缺省兜底为 "[tool_use <name>]" 标记。
+func buildTextBlockFromToolUse(bm map[string]any) map[string]any {
+	name, _ := bm["name"].(string)
+	prefix := orphanToolUseTextPrefix + name + "]"
+	if input, ok := bm["input"]; ok {
+		if raw, err := json.Marshal(input); err == nil && len(raw) > 0 && string(raw) != "null" {
+			return map[string]any{"type": "text", "text": prefix + " " + string(raw)}
+		}
+	}
+	return map[string]any{"type": "text", "text": prefix}
+}
+
 // normalizeToolFunctionType 删除 tools[i].type == "function" 字段（OpenAI schema 误用）。
 // Anthropic 仅接受预定义工具 type 白名单(bash/code_execution/text_editor/web_fetch 等)
 // 或省略 type 让其默认为 custom。删除该字段即让客户端定义的工具按 custom 处理。

@@ -1432,6 +1432,15 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 		degraded = append(degraded, "orphan_tool_result:paired")
 	}
 
+	// 8b. 孤儿 tool_use(对话完整性,与 8a 对称): assistant 的 tool_use 块在紧邻下一条
+	// 消息无对应 tool_result 时就地转 text 块。典型成因为客户端在工具调用被中断时把
+	// 半截 assistant turn 连同后续请求一并发出 -> 上游报 "tool_use ids were found
+	// without tool_result blocks immediately after"。Passthrough 路径无 retry，须预防性处理。
+	if next, ok := pairOrphanToolUses(out); ok {
+		out = next
+		degraded = append(degraded, "orphan_tool_use:paired")
+	}
+
 	// 9. 被引用但未声明的工具 -> 补占位 schema（有损）
 	if next, ok := backfillMissingTools(out); ok {
 		out = next
