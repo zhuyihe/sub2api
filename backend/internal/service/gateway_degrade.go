@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"image"
 	_ "image/gif"  // 注册 gif 解码器(供 DecodeConfig)
 	_ "image/jpeg" // 注册 jpeg 解码器
@@ -12,6 +13,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Wei-Shaw/sub2api/internal/pkg/logger"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 	_ "golang.org/x/image/webp" // 注册 webp 解码器
@@ -39,6 +41,9 @@ func pairOrphanToolResults(body []byte) ([]byte, bool) {
 	}
 	messages, ok := unmarshalMessages(body)
 	if !ok || len(messages) == 0 {
+		// DEBUG（待 issue 关闭后移除）：body 含 tool_result 但 unmarshal 失败
+		logger.LegacyPrintf("service.gateway", "[orphan_debug] unmarshal_failed body_len=%d head=%q",
+			len(body), headPreview(body, 200))
 		return body, false
 	}
 
@@ -50,9 +55,82 @@ func pairOrphanToolResults(body []byte) ([]byte, bool) {
 		}
 	}
 	if !changed {
+		// DEBUG（待 issue 关闭后移除）：body 含 tool_result 但没识别任何孤儿
+		logger.LegacyPrintf("service.gateway", "[orphan_debug] no_orphan_found msgs=%d summary=%s",
+			len(messages), messagesSummary(messages))
 		return body, false
 	}
 	return rewriteMessages(body, messages)
+}
+
+// headPreview 返回 body 前 n 字节（用于诊断；超长截断）。
+func headPreview(body []byte, n int) string {
+	if len(body) <= n {
+		return string(body)
+	}
+	return string(body[:n])
+}
+
+// messagesSummary 给出 messages 数组的结构摘要：每条 role + content 类型概要。
+// 仅前 6 条避免日志过长。诊断专用。
+func messagesSummary(messages []any) string {
+	var parts []string
+	limit := len(messages)
+	if limit > 6 {
+		limit = 6
+	}
+	for i := 0; i < limit; i++ {
+		mm, ok := messages[i].(map[string]any)
+		if !ok {
+			parts = append(parts, fmt.Sprintf("[%d:not_map(%T)]", i, messages[i]))
+			continue
+		}
+		role, _ := mm["role"].(string)
+		contentInfo := contentSummary(mm["content"])
+		parts = append(parts, fmt.Sprintf("[%d:%s:%s]", i, role, contentInfo))
+	}
+	if len(messages) > 6 {
+		parts = append(parts, fmt.Sprintf("...total=%d", len(messages)))
+	}
+	return strings.Join(parts, " ")
+}
+
+// contentSummary 描述 content 字段的形态（string / array of types / 其他）。
+func contentSummary(content any) string {
+	switch c := content.(type) {
+	case string:
+		return fmt.Sprintf("string(%d)", len(c))
+	case []any:
+		var types []string
+		for j, b := range c {
+			if j >= 8 {
+				types = append(types, "...")
+				break
+			}
+			bm, ok := b.(map[string]any)
+			if !ok {
+				types = append(types, fmt.Sprintf("notmap(%T)", b))
+				continue
+			}
+			t, _ := bm["type"].(string)
+			if t == "tool_result" {
+				id, _ := bm["tool_use_id"].(string)
+				types = append(types, fmt.Sprintf("tool_result(%s)", id))
+			} else if t == "tool_use" {
+				id, _ := bm["id"].(string)
+				types = append(types, fmt.Sprintf("tool_use(%s)", id))
+			} else if t == "" {
+				types = append(types, "?notype")
+			} else {
+				types = append(types, t)
+			}
+		}
+		return fmt.Sprintf("array[%s]", strings.Join(types, ","))
+	case nil:
+		return "nil"
+	default:
+		return fmt.Sprintf("unknown(%T)", c)
+	}
 }
 
 // convertOrphansToText 扫描 msg 的 content 数组，将所有 tool_use_id 不在 declared
