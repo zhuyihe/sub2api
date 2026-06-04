@@ -329,12 +329,22 @@ func stripCacheControlOnDeferLoadingTools(body []byte) ([]byte, bool) {
 	changed := false
 	for _, t := range tools {
 		tm, ok := t.(map[string]any)
-		if !ok || tm["defer_loading"] != true {
+		if !ok {
 			continue
 		}
-		if _, has := tm["cache_control"]; has {
-			delete(tm, "cache_control")
-			changed = true
+		// namespace 容器: defer_loading 在嵌套 .tools[] 的 function 上, 需下钻
+		if tm["type"] == "namespace" {
+			if stripDeferLoadingCacheControlInNamespace(tm) {
+				changed = true
+			}
+			continue
+		}
+		// 扁平 function: 顶层直接带 defer_loading
+		if tm["defer_loading"] == true {
+			if _, has := tm["cache_control"]; has {
+				delete(tm, "cache_control")
+				changed = true
+			}
 		}
 	}
 	if !changed {
@@ -349,6 +359,38 @@ func stripCacheControlOnDeferLoadingTools(body []byte) ([]byte, bool) {
 		return body, false
 	}
 	return out, true
+}
+
+// stripDeferLoadingCacheControlInNamespace 处理 namespace 容器: 下钻其 tools[],
+// 删除带 defer_loading:true 的 function 上的 cache_control; 若该 namespace 下存在
+// defer_loading function, 则容器级 cache_control 也一并删除(整个 namespace 不能用
+// prompt caching)。返回是否有改动。
+func stripDeferLoadingCacheControlInNamespace(ns map[string]any) bool {
+	subTools, ok := ns["tools"].([]any)
+	if !ok {
+		return false
+	}
+	changed := false
+	hasDeferLoading := false
+	for _, st := range subTools {
+		stm, ok := st.(map[string]any)
+		if !ok || stm["defer_loading"] != true {
+			continue
+		}
+		hasDeferLoading = true
+		if _, has := stm["cache_control"]; has {
+			delete(stm, "cache_control")
+			changed = true
+		}
+	}
+	// namespace 下有 defer_loading function -> 整体不能 caching, 删容器级 cache_control
+	if hasDeferLoading {
+		if _, has := ns["cache_control"]; has {
+			delete(ns, "cache_control")
+			changed = true
+		}
+	}
+	return changed
 }
 
 // normalizeToolChoice 把字符串形式的 tool_choice 包装为对象 {"type": <value>}。

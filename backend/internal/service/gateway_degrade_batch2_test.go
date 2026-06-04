@@ -101,6 +101,92 @@ func TestStripCacheControlOnDeferLoadingTools(t *testing.T) {
 	})
 }
 
+// TestStripCacheControlOnDeferLoadingTools_NestedNamespace 覆盖生产真实结构:
+// tools[] 元素是 {"type":"namespace","tools":[{"type":"function","defer_loading":true,...}]}
+// 嵌套结构 — defer_loading 在嵌套 function 上, 旧实现只遍历顶层故漏拦(线上 user 104
+// sync_mcp14/update_mcp16 400 即此). 修复后须下钻 namespace.tools[] 清洗。
+func TestStripCacheControlOnDeferLoadingTools_NestedNamespace(t *testing.T) {
+	t.Run("namespace 下 function 带 defer_loading+cache_control -> 删 function cache_control", func(t *testing.T) {
+		body := `{"tools":[
+			{"type":"namespace","name":"mcp_ns","tools":[
+				{"type":"function","name":"sync_mcp14","defer_loading":true,"cache_control":{"type":"ephemeral"},"parameters":{"type":"object"}}
+			]}
+		]}`
+		out, ok := stripCacheControlOnDeferLoadingTools([]byte(body))
+		if !ok {
+			t.Fatal("expected change: 嵌套 function 的 cache_control 应被删")
+		}
+		if gjson.GetBytes(out, "tools.0.tools.0.cache_control").Exists() {
+			t.Fatal("function cache_control 应删除")
+		}
+		if gjson.GetBytes(out, "tools.0.tools.0.defer_loading").Bool() != true {
+			t.Fatal("defer_loading 应保留")
+		}
+		if gjson.GetBytes(out, "tools.0.tools.0.name").String() != "sync_mcp14" {
+			t.Fatal("function 名应保留")
+		}
+	})
+
+	t.Run("namespace 顶层 cache_control + 下有 defer_loading function -> 删 namespace cache_control", func(t *testing.T) {
+		body := `{"tools":[
+			{"type":"namespace","name":"mcp_ns","cache_control":{"type":"ephemeral"},"tools":[
+				{"type":"function","name":"update_mcp16","defer_loading":true,"parameters":{"type":"object"}}
+			]}
+		]}`
+		out, ok := stripCacheControlOnDeferLoadingTools([]byte(body))
+		if !ok {
+			t.Fatal("expected change: namespace 级 cache_control 应被删")
+		}
+		if gjson.GetBytes(out, "tools.0.cache_control").Exists() {
+			t.Fatal("namespace cache_control 应删除")
+		}
+		if gjson.GetBytes(out, "tools.0.tools.0.defer_loading").Bool() != true {
+			t.Fatal("defer_loading 应保留")
+		}
+	})
+
+	t.Run("namespace 下 function 无 defer_loading -> 不动(缓存合法)", func(t *testing.T) {
+		body := `{"tools":[
+			{"type":"namespace","name":"ns","cache_control":{"type":"ephemeral"},"tools":[
+				{"type":"function","name":"f","parameters":{"type":"object"}}
+			]}
+		]}`
+		if _, ok := stripCacheControlOnDeferLoadingTools([]byte(body)); ok {
+			t.Fatal("无 defer_loading 时不应改动")
+		}
+	})
+
+	t.Run("namespace 下 defer_loading function 无 cache_control -> 不动", func(t *testing.T) {
+		body := `{"tools":[
+			{"type":"namespace","name":"ns","tools":[
+				{"type":"function","name":"f","defer_loading":true,"parameters":{"type":"object"}}
+			]}
+		]}`
+		if _, ok := stripCacheControlOnDeferLoadingTools([]byte(body)); ok {
+			t.Fatal("无 cache_control 不应改动")
+		}
+	})
+
+	t.Run("混合: namespace 嵌套 + 扁平 function 各清各的", func(t *testing.T) {
+		body := `{"tools":[
+			{"type":"namespace","name":"ns","tools":[
+				{"type":"function","name":"a","defer_loading":true,"cache_control":{"type":"ephemeral"}}
+			]},
+			{"type":"function","name":"b","defer_loading":true,"cache_control":{"type":"ephemeral"}}
+		]}`
+		out, ok := stripCacheControlOnDeferLoadingTools([]byte(body))
+		if !ok {
+			t.Fatal("expected change")
+		}
+		if gjson.GetBytes(out, "tools.0.tools.0.cache_control").Exists() {
+			t.Fatal("namespace 内 a 的 cache_control 应删")
+		}
+		if gjson.GetBytes(out, "tools.1.cache_control").Exists() {
+			t.Fatal("扁平 b 的 cache_control 应删")
+		}
+	})
+}
+
 func TestAppendUserForAssistantPrefill(t *testing.T) {
 	body := `{"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"prefix"}]}`
 	out, ok := appendUserForAssistantPrefill([]byte(body))
