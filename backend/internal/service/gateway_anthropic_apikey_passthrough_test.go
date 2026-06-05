@@ -910,6 +910,11 @@ func TestGatewayService_AnthropicAPIKeyPassthrough_MissingTerminalEventReturnsEr
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "missing terminal event")
 	require.NotNil(t, result)
+	body := rec.Body.String()
+	require.Contains(t, body, "event: error\n")
+	require.Contains(t, body, `"type":"error"`)
+	require.Contains(t, body, `"upstream_disconnected"`)
+	require.Contains(t, body, "upstream stream ended before message_stop")
 }
 
 func TestGatewayService_AnthropicAPIKeyPassthrough_ForwardDirect_NonStreamingSuccess(t *testing.T) {

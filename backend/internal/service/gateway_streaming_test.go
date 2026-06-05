@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -187,6 +188,38 @@ func TestHandleStreamingResponse_EmptyStream(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "missing terminal event")
 	require.NotNil(t, result)
+}
+
+func TestHandleStreamingResponse_MissingTerminalEventSendsErrorEvent(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	svc := newMinimalGatewayService()
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
+
+	resp := &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body: io.NopCloser(strings.NewReader(strings.Join([]string{
+			`data: {"type":"message_start","message":{"usage":{"input_tokens":5}}}`,
+			"",
+			`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial"}}`,
+			"",
+		}, "\n"))),
+	}
+
+	result, err := svc.handleStreamingResponse(context.Background(), resp, c, &Account{ID: 1}, time.Now(), "model", "model", false)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "missing terminal event")
+	require.NotNil(t, result)
+	body := rec.Body.String()
+	require.Contains(t, body, "content_block_delta")
+	require.Contains(t, body, "event: error\n")
+	require.Contains(t, body, `"type":"error"`)
+	require.Contains(t, body, `"upstream_disconnected"`)
+	require.Contains(t, body, "upstream stream ended before message_stop")
 }
 
 func TestHandleStreamingResponse_SpecialCharactersInJSON(t *testing.T) {
