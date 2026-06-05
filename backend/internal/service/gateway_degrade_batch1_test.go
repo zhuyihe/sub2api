@@ -162,6 +162,30 @@ func TestSanitizeToolUseIDs(t *testing.T) {
 	}
 }
 
+func TestSanitizeAnthropicToolNames(t *testing.T) {
+	longName := strings.Repeat("a", 140)
+	body := `{"tools":[{"name":"bad.tool/name","input_schema":{"type":"object"}},{"name":"` + longName + `","input_schema":{"type":"object"}}],"tool_choice":{"type":"tool","name":"bad.tool/name"},"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"bad.tool/name","input":{}}]}]}`
+	out, ok := sanitizeAnthropicToolNames([]byte(body))
+	if !ok {
+		t.Fatal("expected tool name sanitize")
+	}
+	if got := gjson.GetBytes(out, "tools.0.name").String(); got != "bad_tool_name" {
+		t.Fatalf("tools.0.name=%q, want bad_tool_name", got)
+	}
+	if got := gjson.GetBytes(out, "tool_choice.name").String(); got != "bad_tool_name" {
+		t.Fatalf("tool_choice.name=%q, want bad_tool_name", got)
+	}
+	if got := gjson.GetBytes(out, "messages.0.content.0.name").String(); got != "bad_tool_name" {
+		t.Fatalf("tool_use.name=%q, want bad_tool_name", got)
+	}
+	if got := gjson.GetBytes(out, "tools.1.name").String(); len(got) != maxAnthropicToolNameLength {
+		t.Fatalf("long tool name length=%d, want %d", len(got), maxAnthropicToolNameLength)
+	}
+	if _, ok := sanitizeAnthropicToolNames([]byte(`{"tools":[{"name":"valid_name-1","input_schema":{}}],"tool_choice":{"type":"auto"},"messages":[]}`)); ok {
+		t.Fatal("valid names should not change")
+	}
+}
+
 func TestLimitCacheControlBlocks(t *testing.T) {
 	// 5 个 cache_control，上限 4，应删 1
 	body := `{"system":[

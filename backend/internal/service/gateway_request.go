@@ -1304,7 +1304,7 @@ var anthropic4xModelRe = regexp.MustCompile(`claude-(?:opus|sonnet)-4-`)
 
 // reasoningEffortPaths 是 effort 透传字段可能出现的 JSON 路径。
 // 网关本身不解析 effort（仅 model-pricing 用 reasoning_effort 命名），故覆盖常见路径。
-var reasoningEffortPaths = []string{"reasoning_effort", "thinking.effort", "reasoning.effort"}
+var reasoningEffortPaths = []string{"reasoning_effort", "thinking.effort", "reasoning.effort", "output_config.effort"}
 
 // DegradeAnthropicRequestParams 在转发前对客户端不合规参数做"语义无损"降级，
 // 以消除可预期的上游 400。仅处理能安全改写的项；每发生一次降级返回的 changed=true，
@@ -1324,7 +1324,7 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 
 	// 1. effort xhigh -> max（仅当字段值合法但需 normalize）
 	for _, p := range reasoningEffortPaths {
-		if gjson.GetBytes(out, p).String() != "xhigh" {
+		if strings.ToLower(strings.TrimSpace(gjson.GetBytes(out, p).String())) != "xhigh" {
 			continue
 		}
 		if next, err := sjson.SetBytes(out, p, "max"); err == nil {
@@ -1422,6 +1422,14 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 	if next, ok := normalizeToolFunctionType(out); ok {
 		out = next
 		degraded = append(degraded, "tools_type_function:removed")
+	}
+
+	// 5a1. Anthropic custom tool name 仅允许 [a-zA-Z0-9_-] 且最长 128。
+	// 客户端常把 OpenAI/IDE 工具名带空格、点号、斜杠或本地化字符透传过来，
+	// 上游会直接 400("tools.N.custom.name: String should match pattern ...")。
+	if next, ok := sanitizeAnthropicToolNames(out); ok {
+		out = next
+		degraded = append(degraded, "tool_name:sanitized")
 	}
 
 	// 5b. tools[] 同时含 defer_loading:true 与 cache_control -> 删 cache_control

@@ -26,6 +26,33 @@ func TestDegradeAnthropicRequestParams(t *testing.T) {
 			},
 		},
 		{
+			name:    "effort xhigh output_config.effort 改 max",
+			body:    `{"model":"claude-opus-4-8","output_config":{"effort":"xhigh"},"messages":[{"role":"user","content":"hi"}]}`,
+			model:   "claude-opus-4-8",
+			wantNum: 1,
+			assertion: func(t *testing.T, out []byte) {
+				if got := gjson.GetBytes(out, "output_config.effort").String(); got != "max" {
+					t.Fatalf("output_config.effort=%q, want max", got)
+				}
+			},
+		},
+		{
+			name:    "wrapped custom tool invalid name 被扁平并清洗",
+			body:    `{"model":"claude-opus-4-8","tools":[{"type":"custom","custom":{"name":"bad.tool/name","input_schema":{"type":"object"}}}],"tool_choice":{"type":"tool","name":"bad.tool/name"},"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"bad.tool/name","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"ok"}]}]}`,
+			model:   "claude-opus-4-8",
+			wantNum: 2,
+			assertion: func(t *testing.T, out []byte) {
+				if gjson.GetBytes(out, "tools.0.custom").Exists() {
+					t.Fatal("custom wrapper should be removed")
+				}
+				for _, path := range []string{"tools.0.name", "tool_choice.name", "messages.1.content.0.name"} {
+					if got := gjson.GetBytes(out, path).String(); got != "bad_tool_name" {
+						t.Fatalf("%s=%q, want bad_tool_name", path, got)
+					}
+				}
+			},
+		},
+		{
 			name:    "4.x 模型 temperature 与 top_p 均弃用,全部删除",
 			body:    `{"model":"claude-sonnet-4-6","temperature":0.7,"top_p":0.9,"messages":[{"role":"user","content":"hi"}]}`,
 			model:   "claude-sonnet-4-6",

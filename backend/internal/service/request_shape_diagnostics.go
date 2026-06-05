@@ -75,6 +75,9 @@ func diagnoseAnthropicMessagesShape(body []byte) requestShapeDiagnostics {
 			addShapeFinding(&diag, "anthropic."+path+":present")
 		}
 	}
+	if strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "output_config.effort").String())) == "xhigh" {
+		addShapeFinding(&diag, "anthropic.output_config.effort:xhigh")
+	}
 	diagnoseAnthropicMessages(body, &diag)
 	diagnoseAnthropicTools(body, &diag)
 	diagnoseAnthropicThinkingBudget(body, &diag)
@@ -134,11 +137,27 @@ func diagnoseAnthropicTools(body []byte, diag *requestShapeDiagnostics) {
 		if tool.Get("parameters").Exists() && !tool.Get("input_schema").Exists() {
 			addShapeFinding(diag, base+".parameters:needs_input_schema")
 		}
+		if hasInvalidAnthropicToolName(tool.Get("name")) {
+			addShapeFinding(diag, base+".name:invalid")
+		}
+		if hasInvalidAnthropicToolName(tool.Get("custom.name")) {
+			addShapeFinding(diag, base+".custom.name:invalid")
+		}
+		if hasInvalidAnthropicToolName(tool.Get("function.name")) {
+			addShapeFinding(diag, base+".function.name:invalid")
+		}
 		if tool.Get("defer_loading").Bool() && tool.Get("cache_control").Exists() {
 			addShapeFinding(diag, base+".defer_loading_cache_control:conflict")
 		}
 		return true
 	})
+}
+
+func hasInvalidAnthropicToolName(name gjson.Result) bool {
+	if !name.Exists() || name.Type != gjson.String {
+		return false
+	}
+	return sanitizeAnthropicToolName(name.String()) != name.String()
 }
 
 func diagnoseAnthropicThinkingBudget(body []byte, diag *requestShapeDiagnostics) {

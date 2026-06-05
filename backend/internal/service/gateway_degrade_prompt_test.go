@@ -60,3 +60,28 @@ func TestTruncateOversizedPrompt_SmallNoop(t *testing.T) {
 		t.Fatal("small body should not be truncated")
 	}
 }
+
+func TestTruncateOversizedPrompt_TrimsSingleHugeMessage(t *testing.T) {
+	huge := strings.Repeat("x", maxPromptBodyBytes*2)
+	body := []byte(`{"messages":[{"role":"user","content":"` + huge + `"}]}`)
+	out, ok := truncateOversizedPrompt(body)
+	if !ok {
+		t.Fatal("expected single huge message to be trimmed")
+	}
+	if len(out) >= len(body) {
+		t.Fatalf("trimmed size %d not smaller than %d", len(out), len(body))
+	}
+	if len(out) > maxPromptBodyBytes {
+		t.Fatalf("trimmed size %d still exceeds %d", len(out), maxPromptBodyBytes)
+	}
+	if !gjson.ValidBytes(out) {
+		t.Fatal("trimmed body invalid json")
+	}
+	content := gjson.GetBytes(out, "messages.0.content").String()
+	if !strings.HasPrefix(content, truncatedPromptTextPrefix) {
+		t.Fatal("trimmed content should include gateway truncation marker")
+	}
+	if !strings.HasSuffix(content, "xxx") {
+		t.Fatal("trimmed content should preserve tail")
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -600,6 +601,12 @@ func normalizeImageMediaType(body []byte) ([]byte, bool) {
 // invalidToolIDChars 匹配 tool id 中不被上游接受的字符（合法集 [a-zA-Z0-9_-]）。
 var invalidToolIDChars = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
 
+const maxAnthropicToolNameLength = 128
+
+// invalidToolNameChars 匹配 Anthropic custom tool name 中不被接受的字符。
+// 合法格式为 ^[a-zA-Z0-9_-]{1,128}$。
+var invalidToolNameChars = regexp.MustCompile(`[^a-zA-Z0-9_-]`)
+
 // sanitizeToolUseIDs 清洗 tool_use.id 与 tool_result.tool_use_id 中的非法字符。
 // 清洗是确定性的(同一原始 id 映射到同一新 id)，因此引用两端自动保持一致。
 func sanitizeToolUseIDs(body []byte) ([]byte, bool) {
@@ -640,6 +647,131 @@ func sanitizeToolUseIDs(body []byte) ([]byte, bool) {
 		return body, false
 	}
 	return rewriteMessages(body, messages)
+}
+
+// sanitizeAnthropicToolName 将工具名确定性清洗为 Anthropic 接受的 custom tool name。
+func sanitizeAnthropicToolName(name string) string {
+	cleaned := strings.TrimSpace(name)
+	cleaned = invalidToolNameChars.ReplaceAllString(cleaned, "_")
+	if cleaned == "" {
+		cleaned = "tool"
+	}
+	if len(cleaned) > maxAnthropicToolNameLength {
+		cleaned = cleaned[:maxAnthropicToolNameLength]
+	}
+	return cleaned
+}
+
+// sanitizeAnthropicToolNames 清洗 tools[].name、tool_choice.name 和历史 tool_use.name。
+// 同一个原始工具名使用同一映射，避免 tool_choice/tool_use 与 tools 声明脱节。
+func sanitizeAnthropicToolNames(body []byte) ([]byte, bool) {
+	if !bytes.Contains(body, []byte(`"tools"`)) &&
+		!bytes.Contains(body, []byte(`"tool_choice"`)) &&
+		!bytes.Contains(body, []byte(`"tool_use"`)) {
+		return body, false
+	}
+
+	out := body
+	nameMap := map[string]string{}
+	changed := false
+
+	if toolsRes := gjson.GetBytes(out, "tools"); toolsRes.Exists() && toolsRes.IsArray() {
+		var tools []any
+		if err := json.Unmarshal(sliceRawFromBody(out, toolsRes), &tools); err != nil {
+			return body, false
+		}
+		toolsChanged := false
+		for _, tool := range tools {
+			tm, ok := tool.(map[string]any)
+			if !ok {
+				continue
+			}
+			if sanitizeToolNameInMap(tm, nameMap) {
+				toolsChanged = true
+			}
+			for _, wrapperKey := range []string{"custom", "function"} {
+				wrapper, ok := tm[wrapperKey].(map[string]any)
+				if ok && sanitizeToolNameInMap(wrapper, nameMap) {
+					toolsChanged = true
+				}
+			}
+		}
+		if toolsChanged {
+			tb, err := json.Marshal(tools)
+			if err != nil {
+				return body, false
+			}
+			next, err := sjson.SetRawBytes(out, "tools", tb)
+			if err != nil {
+				return body, false
+			}
+			out = next
+			changed = true
+		}
+	}
+
+	if tcName := gjson.GetBytes(out, "tool_choice.name"); tcName.Exists() && tcName.Type == gjson.String {
+		if sanitized := mappedAnthropicToolName(tcName.String(), nameMap); sanitized != tcName.String() {
+			if next, err := sjson.SetBytes(out, "tool_choice.name", sanitized); err == nil {
+				out = next
+				changed = true
+			}
+		}
+	}
+
+	messages, ok := unmarshalMessages(out)
+	if ok {
+		messagesChanged := false
+		forEachContentBlock(messages, func(bm map[string]any) {
+			if bm["type"] != "tool_use" {
+				return
+			}
+			name, ok := bm["name"].(string)
+			if !ok {
+				return
+			}
+			if sanitized := mappedAnthropicToolName(name, nameMap); sanitized != name {
+				bm["name"] = sanitized
+				messagesChanged = true
+			}
+		})
+		if messagesChanged {
+			next, ok := rewriteMessages(out, messages)
+			if !ok {
+				return body, false
+			}
+			out = next
+			changed = true
+		}
+	}
+
+	if !changed {
+		return body, false
+	}
+	return out, true
+}
+
+func sanitizeToolNameInMap(obj map[string]any, nameMap map[string]string) bool {
+	name, ok := obj["name"].(string)
+	if !ok {
+		return false
+	}
+	sanitized := sanitizeAnthropicToolName(name)
+	nameMap[name] = sanitized
+	if sanitized == name {
+		return false
+	}
+	obj["name"] = sanitized
+	return true
+}
+
+func mappedAnthropicToolName(name string, nameMap map[string]string) string {
+	if mapped, ok := nameMap[name]; ok {
+		return mapped
+	}
+	sanitized := sanitizeAnthropicToolName(name)
+	nameMap[name] = sanitized
+	return sanitized
 }
 
 // limitCacheControlBlocks 当 cache_control 断点超过上限时，删除多余的(保留靠前的)，
@@ -687,43 +819,155 @@ func limitCacheControlBlocks(body []byte, max int) ([]byte, bool) {
 // 可能误伤接近上限的正常长对话，也可能漏掉略超的请求。
 const maxPromptBodyBytes = 650 * 1024
 
-// truncateOversizedPrompt 当请求体过大时，从最旧消息开始丢弃、保留最近消息，
-// 使其落入预算内，避免 prompt too long 的 400。保留顶层 system/tools 不动，
-// 并确保截断后首条消息为 user。有损：丢弃历史，模型可能缺失上下文。
+const truncatedPromptTextPrefix = "[gateway truncated oversized prompt]\n"
+
+// truncateOversizedPrompt 当请求体过大时，从最旧消息开始丢弃、保留最近消息。
+// 如果单条消息本身就超限，则继续裁剪最旧文本内容的前缀、保留尾部近期内容。
+// 保留顶层 system/tools 不动，并确保截断后首条消息为 user。
+// 有损：丢弃历史/文本前缀，模型可能缺失上下文。
 func truncateOversizedPrompt(body []byte) ([]byte, bool) {
 	if len(body) <= maxPromptBodyBytes {
 		return body, false
 	}
 	messages, ok := unmarshalMessages(body)
-	if !ok || len(messages) <= 2 {
+	if !ok {
 		return body, false
 	}
 
 	budget := maxPromptBodyBytes * 8 / 10
-	used := len(body) - len(gjson.GetBytes(body, "messages").Raw) // system/tools 等固定开销
-	kept := make([]any, 0, len(messages))
-	for i := len(messages) - 1; i >= 0; i-- {
-		raw, err := json.Marshal(messages[i])
-		if err != nil {
-			return body, false
+	out := body
+	changed := false
+
+	if len(messages) > 2 {
+		used := len(out) - len(gjson.GetBytes(out, "messages").Raw) // system/tools 等固定开销
+		kept := make([]any, 0, len(messages))
+		for i := len(messages) - 1; i >= 0; i-- {
+			raw, err := json.Marshal(messages[i])
+			if err != nil {
+				return body, false
+			}
+			if used+len(raw) > budget && len(kept) > 0 {
+				break
+			}
+			used += len(raw)
+			kept = append([]any{messages[i]}, kept...)
 		}
-		if used+len(raw) > budget && len(kept) > 0 {
+		// 确保首条为 user（Anthropic 要求）
+		for len(kept) > 0 {
+			if first, ok := kept[0].(map[string]any); ok && first["role"] == "user" {
+				break
+			}
+			kept = kept[1:]
+		}
+		if len(kept) > 0 && len(kept) < len(messages) {
+			if next, ok := rewriteMessages(out, kept); ok {
+				out = next
+				messages = kept
+				changed = true
+			}
+		}
+	}
+
+	for pass := 0; pass < 4 && len(out) > budget; pass++ {
+		currentMessages, ok := unmarshalMessages(out)
+		if !ok {
 			break
 		}
-		used += len(raw)
-		kept = append([]any{messages[i]}, kept...)
-	}
-	// 确保首条为 user（Anthropic 要求）
-	for len(kept) > 0 {
-		if first, ok := kept[0].(map[string]any); ok && first["role"] == "user" {
+		excess := len(out) - budget + 4096
+		if !trimOldestMessageText(currentMessages, excess) {
 			break
 		}
-		kept = kept[1:]
+		next, ok := rewriteMessages(out, currentMessages)
+		if !ok {
+			break
+		}
+		out = next
+		changed = true
 	}
-	if len(kept) == 0 || len(kept) == len(messages) {
+
+	if !changed {
 		return body, false
 	}
-	return rewriteMessages(body, kept)
+	return out, true
+}
+
+func trimOldestMessageText(messages []any, targetReduction int) bool {
+	if targetReduction <= 0 {
+		return false
+	}
+	remaining := targetReduction
+	changed := false
+	for _, msg := range messages {
+		mm, ok := msg.(map[string]any)
+		if !ok {
+			continue
+		}
+		switch content := mm["content"].(type) {
+		case string:
+			next, reduced, ok := trimTextPrefixForBudget(content, remaining)
+			if !ok {
+				continue
+			}
+			mm["content"] = next
+			remaining -= reduced
+			changed = true
+		case []any:
+			for _, block := range content {
+				bm, ok := block.(map[string]any)
+				if !ok || bm["type"] != "text" {
+					continue
+				}
+				text, ok := bm["text"].(string)
+				if !ok {
+					continue
+				}
+				next, reduced, ok := trimTextPrefixForBudget(text, remaining)
+				if !ok {
+					continue
+				}
+				bm["text"] = next
+				remaining -= reduced
+				changed = true
+				if remaining <= 0 {
+					return changed
+				}
+			}
+		}
+		if remaining <= 0 {
+			return changed
+		}
+	}
+	return changed
+}
+
+func trimTextPrefixForBudget(text string, targetReduction int) (string, int, bool) {
+	if text == "" || targetReduction <= 0 {
+		return text, 0, false
+	}
+	if len(text) <= len(truncatedPromptTextPrefix) {
+		return text, 0, false
+	}
+	needToRemove := targetReduction + len(truncatedPromptTextPrefix)
+	if needToRemove >= len(text) {
+		return truncatedPromptTextPrefix, len(text) - len(truncatedPromptTextPrefix), true
+	}
+	keepBytes := len(text) - needToRemove
+	if keepBytes <= 0 {
+		return truncatedPromptTextPrefix, len(text) - len(truncatedPromptTextPrefix), true
+	}
+	start := len(text) - keepBytes
+	for start < len(text) && !utf8.RuneStart(text[start]) {
+		start++
+	}
+	if start >= len(text) {
+		return truncatedPromptTextPrefix, len(text) - len(truncatedPromptTextPrefix), true
+	}
+	next := truncatedPromptTextPrefix + text[start:]
+	reduced := len(text) - len(next)
+	if reduced <= 0 {
+		return text, 0, false
+	}
+	return next, reduced, true
 }
 
 // looksLikeInvalidJSONError 判断上游 400 错误体是否为 JSON/转义格式问题，
