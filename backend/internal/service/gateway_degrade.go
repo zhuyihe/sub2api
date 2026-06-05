@@ -862,7 +862,6 @@ func truncateOversizedPrompt(body []byte) ([]byte, bool) {
 		if len(kept) > 0 && len(kept) < len(messages) {
 			if next, ok := rewriteMessages(out, kept); ok {
 				out = next
-				messages = kept
 				changed = true
 			}
 		}
