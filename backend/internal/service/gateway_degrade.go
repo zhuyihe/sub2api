@@ -361,16 +361,12 @@ func normalizeWrappedToolSchemas(body []byte) ([]byte, bool) {
 func normalizeWrappedToolSchema(tm map[string]any) bool {
 	changed := false
 	if wrapper, ok := tm["function"].(map[string]any); ok {
-		if liftWrappedToolFields(tm, wrapper) {
-			changed = true
-		}
+		_ = liftWrappedToolFields(tm, wrapper)
 		delete(tm, "function")
 		changed = true
 	}
 	if wrapper, ok := tm["custom"].(map[string]any); ok {
-		if liftWrappedToolFields(tm, wrapper) {
-			changed = true
-		}
+		_ = liftWrappedToolFields(tm, wrapper)
 		delete(tm, "custom")
 		changed = true
 	}
