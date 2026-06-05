@@ -16,7 +16,8 @@ type chatMessageContent struct {
 // true. store is always false and reasoning.encrypted_content is always
 // included so that the response translator has full context.
 func ChatCompletionsToResponses(req *ChatCompletionsRequest) (*ResponsesRequest, error) {
-	input, err := convertChatMessagesToResponsesInput(req.Messages)
+	convertCtx := newChatToResponsesContext(req)
+	input, err := convertChatMessagesToResponsesInput(req.Messages, convertCtx)
 	if err != nil {
 		return nil, err
 	}
@@ -89,12 +90,60 @@ func ChatCompletionsToResponses(req *ChatCompletionsRequest) (*ResponsesRequest,
 	return out, nil
 }
 
+type chatToResponsesContext struct {
+	fallbackToolName string
+	validToolCallIDs map[string]bool
+}
+
+func newChatToResponsesContext(req *ChatCompletionsRequest) chatToResponsesContext {
+	ctx := chatToResponsesContext{
+		fallbackToolName: singleChatToolName(req.Tools, req.Functions),
+		validToolCallIDs: map[string]bool{},
+	}
+	for _, msg := range req.Messages {
+		if msg.Role != "assistant" {
+			continue
+		}
+		for _, tc := range msg.ToolCalls {
+			id, _, _, ok := normalizeChatToolCallForResponses(tc, ctx.fallbackToolName)
+			if ok {
+				ctx.validToolCallIDs[id] = true
+			}
+		}
+	}
+	return ctx
+}
+
+func singleChatToolName(tools []ChatTool, functions []ChatFunction) string {
+	names := map[string]bool{}
+	for _, tool := range tools {
+		if tool.Type != "function" || tool.Function == nil {
+			continue
+		}
+		if name := strings.TrimSpace(tool.Function.Name); name != "" {
+			names[name] = true
+		}
+	}
+	for _, fn := range functions {
+		if name := strings.TrimSpace(fn.Name); name != "" {
+			names[name] = true
+		}
+	}
+	if len(names) != 1 {
+		return ""
+	}
+	for name := range names {
+		return name
+	}
+	return ""
+}
+
 // convertChatMessagesToResponsesInput converts the Chat Completions messages
 // array into a Responses API input items array.
-func convertChatMessagesToResponsesInput(msgs []ChatMessage) ([]ResponsesInputItem, error) {
+func convertChatMessagesToResponsesInput(msgs []ChatMessage, ctx chatToResponsesContext) ([]ResponsesInputItem, error) {
 	var out []ResponsesInputItem
 	for _, m := range msgs {
-		items, err := chatMessageToResponsesItems(m)
+		items, err := chatMessageToResponsesItems(m, ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -105,16 +154,16 @@ func convertChatMessagesToResponsesInput(msgs []ChatMessage) ([]ResponsesInputIt
 
 // chatMessageToResponsesItems converts a single ChatMessage into one or more
 // ResponsesInputItem values.
-func chatMessageToResponsesItems(m ChatMessage) ([]ResponsesInputItem, error) {
+func chatMessageToResponsesItems(m ChatMessage, ctx chatToResponsesContext) ([]ResponsesInputItem, error) {
 	switch m.Role {
 	case "system":
 		return chatSystemToResponses(m)
 	case "user":
 		return chatUserToResponses(m)
 	case "assistant":
-		return chatAssistantToResponses(m)
+		return chatAssistantToResponses(m, ctx)
 	case "tool":
-		return chatToolToResponses(m)
+		return chatToolToResponses(m, ctx)
 	case "function":
 		return chatFunctionToResponses(m)
 	default:
@@ -153,8 +202,9 @@ func chatUserToResponses(m ChatMessage) ([]ResponsesInputItem, error) {
 // text content and tool_calls, the text is emitted as an assistant message
 // first, then each tool_call becomes a function_call item. If the content is
 // empty/nil and there are tool_calls, only function_call items are emitted.
-func chatAssistantToResponses(m ChatMessage) ([]ResponsesInputItem, error) {
+func chatAssistantToResponses(m ChatMessage, ctx chatToResponsesContext) ([]ResponsesInputItem, error) {
 	var items []ResponsesInputItem
+	var toolItems []ResponsesInputItem
 	content := ""
 
 	if m.ReasoningContent != "" {
@@ -175,6 +225,26 @@ func chatAssistantToResponses(m ChatMessage) ([]ResponsesInputItem, error) {
 		}
 	}
 
+	// Emit one function_call item per valid tool_call. OpenAI Responses rejects
+	// function_call input items without call_id or name; malformed replayed
+	// history is preserved as assistant text instead of poisoning the request.
+	for _, tc := range m.ToolCalls {
+		id, name, args, ok := normalizeChatToolCallForResponses(tc, ctx.fallbackToolName)
+		if !ok {
+			if content != "" {
+				content += "\n"
+			}
+			content += invalidChatToolCallText(tc)
+			continue
+		}
+		toolItems = append(toolItems, ResponsesInputItem{
+			Type:      "function_call",
+			CallID:    id,
+			Name:      name,
+			Arguments: args,
+		})
+	}
+
 	if content != "" {
 		parts := []ResponsesContentPart{{Type: "output_text", Text: content}}
 		partsJSON, err := json.Marshal(parts)
@@ -184,21 +254,33 @@ func chatAssistantToResponses(m ChatMessage) ([]ResponsesInputItem, error) {
 		items = append(items, ResponsesInputItem{Role: "assistant", Content: partsJSON})
 	}
 
-	// Emit one function_call item per tool_call.
-	for _, tc := range m.ToolCalls {
-		args := tc.Function.Arguments
-		if args == "" {
-			args = "{}"
-		}
-		items = append(items, ResponsesInputItem{
-			Type:      "function_call",
-			CallID:    tc.ID,
-			Name:      tc.Function.Name,
-			Arguments: args,
-		})
-	}
+	items = append(items, toolItems...)
 
 	return items, nil
+}
+
+func normalizeChatToolCallForResponses(tc ChatToolCall, fallbackName string) (string, string, string, bool) {
+	id := strings.TrimSpace(tc.ID)
+	name := strings.TrimSpace(tc.Function.Name)
+	if name == "" {
+		name = fallbackName
+	}
+	if id == "" || name == "" {
+		return "", "", "", false
+	}
+	args := tc.Function.Arguments
+	if strings.TrimSpace(args) == "" {
+		args = "{}"
+	}
+	return id, name, args, true
+}
+
+func invalidChatToolCallText(tc ChatToolCall) string {
+	id := strings.TrimSpace(tc.ID)
+	if id == "" {
+		id = "missing_id"
+	}
+	return "[invalid_tool_call " + id + "] omitted because call_id or function.name was missing."
 }
 
 // parseAssistantContent returns assistant content as plain text.
@@ -273,7 +355,11 @@ func parseAssistantContent(raw json.RawMessage) (string, error) {
 
 // chatToolToResponses converts a tool result message (role=tool) into a
 // function_call_output item.
-func chatToolToResponses(m ChatMessage) ([]ResponsesInputItem, error) {
+func chatToolToResponses(m ChatMessage, ctx chatToResponsesContext) ([]ResponsesInputItem, error) {
+	callID := strings.TrimSpace(m.ToolCallID)
+	if callID == "" || !ctx.validToolCallIDs[callID] {
+		return nil, nil
+	}
 	output, err := parseChatContent(m.Content)
 	if err != nil {
 		return nil, err
@@ -283,7 +369,7 @@ func chatToolToResponses(m ChatMessage) ([]ResponsesInputItem, error) {
 	}
 	return []ResponsesInputItem{{
 		Type:   "function_call_output",
-		CallID: m.ToolCallID,
+		CallID: callID,
 		Output: output,
 	}}, nil
 }

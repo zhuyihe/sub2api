@@ -99,6 +99,20 @@ func TestDegradeAnthropicRequestParams(t *testing.T) {
 			},
 		},
 		{
+			name:    "OpenAI 顶层 stream_options 和 group 字段删除",
+			body:    `{"model":"claude-opus-4-8","stream_options":{"include_usage":true},"group":"debug","messages":[{"role":"user","content":"hi"}]}`,
+			model:   "claude-opus-4-8",
+			wantNum: 2,
+			assertion: func(t *testing.T, out []byte) {
+				if gjson.GetBytes(out, "stream_options").Exists() {
+					t.Fatal("stream_options should be removed")
+				}
+				if gjson.GetBytes(out, "group").Exists() {
+					t.Fatal("group should be removed")
+				}
+			},
+		},
+		{
 			name:    "老模型保留 top_k",
 			body:    `{"model":"claude-3-5-sonnet","top_k":40,"messages":[{"role":"user","content":"hi"}]}`,
 			model:   "claude-3-5-sonnet",

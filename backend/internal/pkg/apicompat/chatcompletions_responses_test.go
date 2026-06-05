@@ -113,6 +113,97 @@ func TestChatCompletionsToResponses_ToolCalls(t *testing.T) {
 	assert.Equal(t, "ping", resp.Tools[0].Name)
 }
 
+func TestChatCompletionsToResponses_ToolCallMissingNameUsesSingleToolFallback(t *testing.T) {
+	req := &ChatCompletionsRequest{
+		Model: "gpt-5.5",
+		Messages: []ChatMessage{
+			{Role: "user", Content: json.RawMessage(`"Call the only tool"`)},
+			{
+				Role: "assistant",
+				ToolCalls: []ChatToolCall{
+					{
+						ID:   "call_1",
+						Type: "function",
+						Function: ChatFunctionCall{
+							Arguments: `{"q":"status"}`,
+						},
+					},
+				},
+			},
+			{
+				Role:       "tool",
+				ToolCallID: "call_1",
+				Content:    json.RawMessage(`"ok"`),
+			},
+		},
+		Tools: []ChatTool{
+			{
+				Type: "function",
+				Function: &ChatFunction{
+					Name:       "lookup_status",
+					Parameters: json.RawMessage(`{"type":"object"}`),
+				},
+			},
+		},
+	}
+
+	resp, err := ChatCompletionsToResponses(req)
+	require.NoError(t, err)
+
+	var items []ResponsesInputItem
+	require.NoError(t, json.Unmarshal(resp.Input, &items))
+	require.Len(t, items, 3)
+	assert.Equal(t, "function_call", items[1].Type)
+	assert.Equal(t, "call_1", items[1].CallID)
+	assert.Equal(t, "lookup_status", items[1].Name)
+	assert.Equal(t, "function_call_output", items[2].Type)
+	assert.Equal(t, "call_1", items[2].CallID)
+}
+
+func TestChatCompletionsToResponses_ToolCallMissingNameWithoutFallbackIsNotSentAsFunctionCall(t *testing.T) {
+	req := &ChatCompletionsRequest{
+		Model: "gpt-5.5",
+		Messages: []ChatMessage{
+			{Role: "user", Content: json.RawMessage(`"Call a tool"`)},
+			{
+				Role: "assistant",
+				ToolCalls: []ChatToolCall{
+					{
+						ID:   "call_bad",
+						Type: "function",
+						Function: ChatFunctionCall{
+							Arguments: `{"q":"status"}`,
+						},
+					},
+				},
+			},
+			{
+				Role:       "tool",
+				ToolCallID: "call_bad",
+				Content:    json.RawMessage(`"ok"`),
+			},
+		},
+		Tools: []ChatTool{
+			{Type: "function", Function: &ChatFunction{Name: "lookup_a"}},
+			{Type: "function", Function: &ChatFunction{Name: "lookup_b"}},
+		},
+	}
+
+	resp, err := ChatCompletionsToResponses(req)
+	require.NoError(t, err)
+
+	var items []ResponsesInputItem
+	require.NoError(t, json.Unmarshal(resp.Input, &items))
+	for _, item := range items {
+		require.NotEqual(t, "function_call", item.Type)
+		require.NotEqual(t, "function_call_output", item.Type)
+		require.NotEqual(t, "call_bad", item.CallID)
+	}
+	require.Len(t, items, 2)
+	assert.Equal(t, "assistant", items[1].Role)
+	assert.Contains(t, string(items[1].Content), "invalid_tool_call call_bad")
+}
+
 func TestChatCompletionsToResponses_MaxTokens(t *testing.T) {
 	t.Run("max_tokens", func(t *testing.T) {
 		maxTokens := 100

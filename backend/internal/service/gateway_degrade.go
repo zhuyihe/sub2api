@@ -309,6 +309,111 @@ func normalizeToolFunctionType(body []byte) ([]byte, bool) {
 	return out, true
 }
 
+// normalizeWrappedToolSchemas flattens OpenAI/wrapper-shaped tool definitions into
+// Anthropic's custom tool shape: {name, description, input_schema}.
+//
+// Covered client variants:
+//   - {"type":"function","function":{"name":"x","parameters":{...}}}
+//   - {"type":"custom","custom":{"name":"x","input_schema":{...}}}
+//   - {"type":"custom","name":"x","parameters":{...}}
+//
+// This is a lossy schema normalization only in the sense that wrapper keys are removed;
+// tool identity and input schema are preserved where present.
+func normalizeWrappedToolSchemas(body []byte) ([]byte, bool) {
+	if !bytes.Contains(body, []byte(`"tools"`)) ||
+		(!bytes.Contains(body, []byte(`"function"`)) &&
+			!bytes.Contains(body, []byte(`"custom"`)) &&
+			!bytes.Contains(body, []byte(`"parameters"`))) {
+		return body, false
+	}
+	toolsRes := gjson.GetBytes(body, "tools")
+	if !toolsRes.Exists() || !toolsRes.IsArray() {
+		return body, false
+	}
+	var tools []any
+	if err := json.Unmarshal(sliceRawFromBody(body, toolsRes), &tools); err != nil {
+		return body, false
+	}
+	changed := false
+	for _, tool := range tools {
+		tm, ok := tool.(map[string]any)
+		if !ok {
+			continue
+		}
+		if normalizeWrappedToolSchema(tm) {
+			changed = true
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	tb, err := json.Marshal(tools)
+	if err != nil {
+		return body, false
+	}
+	out, err := sjson.SetRawBytes(body, "tools", tb)
+	if err != nil {
+		return body, false
+	}
+	return out, true
+}
+
+func normalizeWrappedToolSchema(tm map[string]any) bool {
+	changed := false
+	if wrapper, ok := tm["function"].(map[string]any); ok {
+		if liftWrappedToolFields(tm, wrapper) {
+			changed = true
+		}
+		delete(tm, "function")
+		changed = true
+	}
+	if wrapper, ok := tm["custom"].(map[string]any); ok {
+		if liftWrappedToolFields(tm, wrapper) {
+			changed = true
+		}
+		delete(tm, "custom")
+		changed = true
+	}
+	if typ, _ := tm["type"].(string); typ == "function" || typ == "custom" {
+		delete(tm, "type")
+		changed = true
+	}
+	if _, hasInputSchema := tm["input_schema"]; !hasInputSchema {
+		if params, hasParams := tm["parameters"]; hasParams {
+			tm["input_schema"] = params
+			delete(tm, "parameters")
+			changed = true
+		}
+	} else if _, hasParams := tm["parameters"]; hasParams {
+		delete(tm, "parameters")
+		changed = true
+	}
+	return changed
+}
+
+func liftWrappedToolFields(dst, src map[string]any) bool {
+	changed := false
+	for _, key := range []string{"name", "description"} {
+		if _, exists := dst[key]; exists {
+			continue
+		}
+		if value, exists := src[key]; exists {
+			dst[key] = value
+			changed = true
+		}
+	}
+	if _, exists := dst["input_schema"]; !exists {
+		if value, ok := src["input_schema"]; ok {
+			dst["input_schema"] = value
+			changed = true
+		} else if value, ok := src["parameters"]; ok {
+			dst["input_schema"] = value
+			changed = true
+		}
+	}
+	return changed
+}
+
 // stripCacheControlOnDeferLoadingTools 删除同时设置了 defer_loading:true 与 cache_control
 // 的工具上的 cache_control 字段。Anthropic 规定 defer_loading 工具不能用 prompt caching，
 // 二者并存触发 400("Tools with defer_loading cannot use prompt caching")。删 cache_control
@@ -391,6 +496,34 @@ func stripDeferLoadingCacheControlInNamespace(ns map[string]any) bool {
 		}
 	}
 	return changed
+}
+
+// stripMessageLevelCacheControl removes cache_control directly attached to a
+// messages[i] object. Anthropic accepts cache_control on supported content blocks,
+// but rejects message-level cache_control with "Extra inputs are not permitted".
+func stripMessageLevelCacheControl(body []byte) ([]byte, bool) {
+	if !bytes.Contains(body, []byte("cache_control")) {
+		return body, false
+	}
+	messages, ok := unmarshalMessages(body)
+	if !ok {
+		return body, false
+	}
+	changed := false
+	for _, msg := range messages {
+		mm, ok := msg.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, has := mm["cache_control"]; has {
+			delete(mm, "cache_control")
+			changed = true
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	return rewriteMessages(body, messages)
 }
 
 // normalizeToolChoice 把字符串形式的 tool_choice 包装为对象 {"type": <value>}。

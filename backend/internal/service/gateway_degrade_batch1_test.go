@@ -30,6 +30,65 @@ func TestNormalizeToolFunctionType(t *testing.T) {
 	}
 }
 
+func TestNormalizeWrappedToolSchemas(t *testing.T) {
+	t.Run("OpenAI function wrapper flattened", func(t *testing.T) {
+		body := `{"tools":[{"type":"function","function":{"name":"lookup","description":"Lookup data","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}],"messages":[]}`
+		out, ok := normalizeWrappedToolSchemas([]byte(body))
+		if !ok {
+			t.Fatal("expected change")
+		}
+		if gjson.GetBytes(out, "tools.0.type").Exists() {
+			t.Fatal("function type should be removed")
+		}
+		if gjson.GetBytes(out, "tools.0.function").Exists() {
+			t.Fatal("function wrapper should be removed")
+		}
+		if got := gjson.GetBytes(out, "tools.0.name").String(); got != "lookup" {
+			t.Fatalf("name=%q, want lookup", got)
+		}
+		if got := gjson.GetBytes(out, "tools.0.input_schema.properties.q.type").String(); got != "string" {
+			t.Fatalf("input_schema not lifted, got %q", got)
+		}
+	})
+
+	t.Run("custom wrapper missing nested name fixed by flattening", func(t *testing.T) {
+		body := `{"tools":[{"type":"custom","name":"edit","custom":{"input_schema":{"type":"object"}}}],"messages":[]}`
+		out, ok := normalizeWrappedToolSchemas([]byte(body))
+		if !ok {
+			t.Fatal("expected change")
+		}
+		if gjson.GetBytes(out, "tools.0.type").Exists() {
+			t.Fatal("custom type should be removed")
+		}
+		if gjson.GetBytes(out, "tools.0.custom").Exists() {
+			t.Fatal("custom wrapper should be removed")
+		}
+		if got := gjson.GetBytes(out, "tools.0.name").String(); got != "edit" {
+			t.Fatalf("name=%q, want edit", got)
+		}
+		if got := gjson.GetBytes(out, "tools.0.input_schema.type").String(); got != "object" {
+			t.Fatalf("input_schema.type=%q, want object", got)
+		}
+	})
+
+	t.Run("flat custom type removed and parameters renamed", func(t *testing.T) {
+		body := `{"tools":[{"type":"custom","name":"run","parameters":{"type":"object"}}],"messages":[]}`
+		out, ok := normalizeWrappedToolSchemas([]byte(body))
+		if !ok {
+			t.Fatal("expected change")
+		}
+		if gjson.GetBytes(out, "tools.0.type").Exists() {
+			t.Fatal("custom type should be removed")
+		}
+		if gjson.GetBytes(out, "tools.0.parameters").Exists() {
+			t.Fatal("parameters should be removed after being renamed")
+		}
+		if got := gjson.GetBytes(out, "tools.0.input_schema.type").String(); got != "object" {
+			t.Fatalf("input_schema.type=%q, want object", got)
+		}
+	})
+}
+
 func TestNormalizeToolChoice(t *testing.T) {
 	out, ok := normalizeToolChoice([]byte(`{"tool_choice":"auto","messages":[]}`))
 	if !ok {
@@ -41,6 +100,23 @@ func TestNormalizeToolChoice(t *testing.T) {
 	// 已是对象时不动
 	if _, ok := normalizeToolChoice([]byte(`{"tool_choice":{"type":"auto"}}`)); ok {
 		t.Fatal("object tool_choice should not change")
+	}
+}
+
+func TestStripMessageLevelCacheControl(t *testing.T) {
+	body := `{"messages":[
+		{"role":"user","content":"hi","cache_control":{"type":"ephemeral"}},
+		{"role":"assistant","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}]}
+	]}`
+	out, ok := stripMessageLevelCacheControl([]byte(body))
+	if !ok {
+		t.Fatal("expected message-level cache_control stripped")
+	}
+	if gjson.GetBytes(out, "messages.0.cache_control").Exists() {
+		t.Fatal("message-level cache_control should be removed")
+	}
+	if !gjson.GetBytes(out, "messages.1.content.0.cache_control").Exists() {
+		t.Fatal("content block cache_control should be kept")
 	}
 }
 

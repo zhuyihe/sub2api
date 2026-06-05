@@ -186,6 +186,7 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 			return nil, fmt.Errorf("remarshal after codex transform: %w", err)
 		}
 	}
+	logOpenAIChatCompletionsShapeDiagnostics(ctx, body, responsesBody, isResponsesShape)
 
 	// 4b. Apply OpenAI fast policy (may filter service_tier or block the request).
 	updatedBody, policyErr := s.applyOpenAIFastPolicyToBody(ctx, account, upstreamModel, responsesBody)

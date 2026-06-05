@@ -4648,6 +4648,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 
 	// 转发前对客户端不合规参数做语义无损降级，消除可预期的上游 400（默认开启，可配置关闭）。
 	if s.cfg == nil || s.cfg.Gateway.DegradeRequestParams {
+		logAnthropicMessagesShapeDiagnostics(ctx, body, "pre_degrade")
 		if degraded, fields := DegradeAnthropicRequestParams(body, reqModel); len(fields) > 0 {
 			if err := replaceBody(degraded); err != nil {
 				return nil, err
@@ -5198,6 +5199,7 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
 	input.Body = StripEmptyTextBlocks(input.Body)
 	// 透传分支同样做语义无损降级，消除可预期的上游 400（默认开启，可配置关闭）。
 	if s.cfg == nil || s.cfg.Gateway.DegradeRequestParams {
+		logAnthropicMessagesShapeDiagnostics(ctx, input.Body, "pre_degrade")
 		if degraded, fields := DegradeAnthropicRequestParams(input.Body, input.RequestModel); len(fields) > 0 {
 			input.Body = degraded
 			logger.LegacyPrintf("service.gateway", "[degrade] request params degraded: %s (model=%s)", strings.Join(fields, "; "), input.RequestModel)

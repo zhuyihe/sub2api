@@ -1363,6 +1363,19 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 		}
 	}
 
+	// 1d. OpenAI/客户端私有字段不被 Anthropic 接受 -> 删除。
+	// stream_options/group 均不是 Anthropic Messages 请求字段，透传会触发
+	// "<field>: Extra inputs are not permitted"。
+	for _, p := range []string{"stream_options", "group"} {
+		if !gjson.GetBytes(out, p).Exists() {
+			continue
+		}
+		if next, ok := deleteJSONPathBytes(out, p); ok {
+			out = next
+			degraded = append(degraded, p+":removed")
+		}
+	}
+
 	// 2. temperature + top_p 冲突 -> 删 temperature
 	if gjson.GetBytes(out, "temperature").Exists() && gjson.GetBytes(out, "top_p").Exists() {
 		if next, ok := deleteJSONPathBytes(out, "temperature"); ok {
@@ -1399,6 +1412,12 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 		degraded = append(degraded, "tool_choice:wrapped_object")
 	}
 
+	// 5a0. OpenAI/包装风格 tools[].function/custom -> Anthropic 扁平 custom tool。
+	if next, ok := normalizeWrappedToolSchemas(out); ok {
+		out = next
+		degraded = append(degraded, "tools_wrapped_schema:flattened")
+	}
+
 	// 5a. tools[].type=="function"(OpenAI schema 误用) -> 删除 type 让默认为 custom
 	if next, ok := normalizeToolFunctionType(out); ok {
 		out = next
@@ -1428,6 +1447,13 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 	if next, ok := limitCacheControlBlocks(out, maxCacheControlBlocks); ok {
 		out = next
 		degraded = append(degraded, "cache_control:trimmed")
+	}
+
+	// 8a0. message 对象级 cache_control 不是 Anthropic Messages 支持位置。
+	// 合法 cache_control 应在 system/content block/tool 等可缓存对象上。
+	if next, ok := stripMessageLevelCacheControl(out); ok {
+		out = next
+		degraded = append(degraded, "message_cache_control:stripped")
 	}
 
 	// 8a. 孤儿 tool_result(对话完整性): 把跨越紧邻 assistant 的孤儿 tool_result
