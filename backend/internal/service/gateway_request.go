@@ -1314,7 +1314,8 @@ var reasoningEffortPaths = []string{"reasoning_effort", "thinking.effort", "reas
 //  1. effort=="xhigh" -> "max"（部分模型仅支持 low/medium/high/max）
 //  2. temperature 与 top_p 同时存在 -> 删除 temperature（保留 top_p）
 //  3. claude-*-4.x 模型上的 temperature（已弃用）-> 删除
-//  4. role=="system" 的 message -> 合并进顶层 system 字段并从 messages 移除
+//  4. messages[].name -> 删除（Anthropic Messages 不接受 message 对象级 name）
+//  5. role=="system" 的 message -> 合并进顶层 system 字段并从 messages 移除
 //
 // 不处理（需客户端修，避免破坏语义）：prompt 过长、图片、未声明工具、
 // 非法 JSON、cache_control 顺序/数量、assistant 结尾 prefill。
@@ -1398,6 +1399,13 @@ func DegradeAnthropicRequestParams(body []byte, model string) ([]byte, []string)
 	if next, ok := rectifyThinkingBudgetVsMaxTokens(out); ok {
 		out = next
 		degraded = append(degraded, "thinking_budget:rectified_vs_max_tokens")
+	}
+
+	// 3c. message 对象级 name 不是 Anthropic Messages 支持字段。
+	// 常见于 OpenAI/IDE 客户端透传，会触发 "messages.0.name: Extra inputs are not permitted"。
+	if next, ok := stripMessageLevelName(out); ok {
+		out = next
+		degraded = append(degraded, "messages_name:removed")
 	}
 
 	// 4. role==system 消息合并进顶层 system

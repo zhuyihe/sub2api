@@ -140,6 +140,23 @@ func TestDegradeAnthropicRequestParams(t *testing.T) {
 			},
 		},
 		{
+			name:    "message 对象级 name 字段删除但保留工具块 name",
+			body:    `{"model":"claude-sonnet-4-6","tools":[{"name":"run_cmd","input_schema":{"type":"object"}}],"messages":[{"role":"user","name":"alice","content":"hi"},{"role":"assistant","name":"bot","content":[{"type":"tool_use","id":"toolu_1","name":"run_cmd","input":{}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}`,
+			model:   "claude-sonnet-4-6",
+			wantNum: 1,
+			assertion: func(t *testing.T, out []byte) {
+				if gjson.GetBytes(out, "messages.0.name").Exists() {
+					t.Fatal("messages.0.name should be removed")
+				}
+				if gjson.GetBytes(out, "messages.1.name").Exists() {
+					t.Fatal("messages.1.name should be removed")
+				}
+				if got := gjson.GetBytes(out, "messages.1.content.0.name").String(); got != "run_cmd" {
+					t.Fatalf("tool_use name=%q, want run_cmd", got)
+				}
+			},
+		},
+		{
 			name:    "老模型保留 top_k",
 			body:    `{"model":"claude-3-5-sonnet","top_k":40,"messages":[{"role":"user","content":"hi"}]}`,
 			model:   "claude-3-5-sonnet",

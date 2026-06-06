@@ -523,6 +523,34 @@ func stripMessageLevelCacheControl(body []byte) ([]byte, bool) {
 	return rewriteMessages(body, messages)
 }
 
+// stripMessageLevelName removes name directly attached to a messages[i] object.
+// Anthropic Messages only accepts role/content on message objects; tool names
+// inside content blocks are handled separately and must be preserved.
+func stripMessageLevelName(body []byte) ([]byte, bool) {
+	if !bytes.Contains(body, []byte(`"name"`)) {
+		return body, false
+	}
+	messages, ok := unmarshalMessages(body)
+	if !ok {
+		return body, false
+	}
+	changed := false
+	for _, msg := range messages {
+		mm, ok := msg.(map[string]any)
+		if !ok {
+			continue
+		}
+		if _, has := mm["name"]; has {
+			delete(mm, "name")
+			changed = true
+		}
+	}
+	if !changed {
+		return body, false
+	}
+	return rewriteMessages(body, messages)
+}
+
 // normalizeToolChoice 把字符串形式的 tool_choice 包装为对象 {"type": <value>}。
 // 上游要求 tool_choice 为对象，客户端误传字符串(如 "auto")会触发 400。
 func normalizeToolChoice(body []byte) ([]byte, bool) {
