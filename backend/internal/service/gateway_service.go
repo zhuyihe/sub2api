@@ -7884,7 +7884,6 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 			if !ok {
 				if len(pendingEventLines) > 0 {
 					outputBlocks, data, usagePatch, err := processSSEEvent(pendingEventLines)
-					pendingEventLines = pendingEventLines[:0]
 					if err != nil {
 						if clientDisconnected {
 							return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: true}, nil
@@ -7900,7 +7899,6 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 								break
 							}
 							flusher.Flush()
-							lastDataAt = time.Now()
 						}
 						if data != "" {
 							if firstTokenMs == nil && data != "[DONE]" {
